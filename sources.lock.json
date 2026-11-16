@@ -1,0 +1,24 @@
+{
+ "description": "Source of the model code: vllm-project/vllm-neuron at the pinned base commit plus the patches below, applied in file-name order with git am. scripts/setup_source.sh checks the patch hashes before applying and the resulting tree hashes after.",
+ "repo": "vllm-neuron",
+ "url": "https://github.com/vllm-project/vllm-neuron",
+ "base_ref": "release-0.29.0.1.2.0",
+ "base_commit": "eb6cb360f7cff6082e22a9437d8ce0ba3891304a",
+ "patches_dir": "patches/vllm-neuron",
+ "patches": [
+  {
+   "file": "0001-vllm-neuron-framework-changes-for-MiMo-V2.6-Flash.patch",
+   "sha256": "f95f70b0c7184a4c2d29f45ab3316767b96b4b0ec21828855ae3550f28c86655"
+  },
+  {
+   "file": "0002-mimo_v2-vendored-copy-of-the-nkilib-moe_tkg-kernels.patch",
+   "sha256": "b2d8c6e5e44c168385e02f229d1ecb0945209a40def384b6cbb9d460dace9fd2"
+  },
+  {
+   "file": "0003-mimo_v2-MiMo-V2.6-Flash-model-for-the-native-backend.patch",
+   "sha256": "9f5ef49e24d74d8ba0cca8c859dff8dc8729c27bad84c0cd312d5a99187a7df5"
+  }
+ ],
+ "expected_head_tree": "2d69ea6bfdd7285d330daa2cfe70ab1aa7f1eb40",
+ "expected_vllm_neuron_subtree": "3910a640fb5a87c0604eebc22555dc5946222639"
+}

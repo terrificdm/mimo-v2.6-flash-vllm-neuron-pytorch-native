@@ -1,0 +1,3061 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Corry K <blueblau@163.com>
+Date: Mon, 16 Nov 2026 12:00:00 +0000
+Subject: [PATCH 2/3] mimo_v2: vendored copy of the nkilib moe_tkg kernels
+
+Copy of the moe_tkg (MoE token-generation) NKI kernels from nkilib, the NKI
+kernel library installed with the AWS Neuron SDK (Apache License 2.0), with
+an all-expert path and a hits-batch variant used by the MiMo-V2 FP8 expert
+decode path.
+---
+ .../model/mimo_v2/nki_moe_tkg/__init__.py     |   98 +
+ .../mimo_v2/nki_moe_tkg/all_expert_impl.py    | 1598 +++++++++++++++++
+ .../nki_moe_tkg/mlp_tkg_down_projection.py    |  317 ++++
+ .../mlp_tkg_down_projection_lhs_rhs_swap.py   |  195 ++
+ .../model/mimo_v2/nki_moe_tkg/moe_tkg.py      |  522 ++++++
+ .../mimo_v2/nki_moe_tkg/moe_tkg_hits_batch.py |  268 +++
+ 6 files changed, 2998 insertions(+)
+ create mode 100644 vllm_neuron/model/mimo_v2/nki_moe_tkg/__init__.py
+ create mode 100644 vllm_neuron/model/mimo_v2/nki_moe_tkg/all_expert_impl.py
+ create mode 100644 vllm_neuron/model/mimo_v2/nki_moe_tkg/mlp_tkg_down_projection.py
+ create mode 100644 vllm_neuron/model/mimo_v2/nki_moe_tkg/mlp_tkg_down_projection_lhs_rhs_swap.py
+ create mode 100644 vllm_neuron/model/mimo_v2/nki_moe_tkg/moe_tkg.py
+ create mode 100644 vllm_neuron/model/mimo_v2/nki_moe_tkg/moe_tkg_hits_batch.py
+
+diff --git a/vllm_neuron/model/mimo_v2/nki_moe_tkg/__init__.py b/vllm_neuron/model/mimo_v2/nki_moe_tkg/__init__.py
+new file mode 100644
+index 0000000..df66059
+--- /dev/null
++++ b/vllm_neuron/model/mimo_v2/nki_moe_tkg/__init__.py
+@@ -0,0 +1,98 @@
++# SPDX-License-Identifier: Apache-2.0
++"""nkilib ``moe_tkg`` (all-expert path) vendored for MiMo-V2 FP8 decode, with one fix (T48).
++
++Source: nkilib ``core/moe/moe_tkg/{moe_tkg,all_expert_impl,mlp_tkg_down_projection,
++mlp_tkg_down_projection_lhs_rhs_swap}.py`` of nki 0.7.0+37713544100.gfede04bb (Neuron SDK
++2.33.0 DLAMI), copied unmodified except the imports (commit "vendor nkilib moe_tkg ...");
++everything else is imported from the installed nkilib.
++
++Fix (``mlp_tkg_down_projection_lhs_rhs_swap.py``, FP8 row quantization): the down projection
++packs the ``H1_shard = H / 128 / LNC`` output tiles of a T-tile into PSUM banks of
++``perBankT = 512 // T`` tiles and multiplies each bank by its slice of the per-channel scales.
++nkilib slices ``[index * bank_size, (index + 1) * bank_size)``, which is the bank's offset only
++when every bank is full; when ``H1_shard % perBankT != 0`` the last bank used the scales of
++other channels. The fix slices ``[start_offset, end_offset)`` of the bank. For MiMo (H1_shard
++16) the unfixed kernel was wrong on every T-tile of 33-56, 65-102 and 129-170 rows (T48 bench:
++rel L2 0.18-0.55 against FP32 at 33/40/48/56/65/72/80/96/100/102/129/160/170/300 rows; right
++at 1-32, 57-64, 103-128, 171-256 rows), a legal input under the kernel's documented range
++(T <= 128). Root cause: reports/tasks/T48/moe-tkg-row-count-root-cause.md.
++
++``mimo_moe_tkg_wrapper`` is ``vllm_neuron.functional.moe.moe_tkg_wrapper.moe_tkg_wrapper``
++(the same arguments and defaults) calling the fixed copy; MiMo passes FP8 weights directly,
++so the wrapper's MX dtype views are not needed.
++"""
++from typing import Optional
++
++import nki
++import nki.language as nl
++from nkilib.core.utils.common_types import (
++    ActFnType,
++    ExpertAffinityScaleMode,
++    MoEAllToAllVStrategy,
++)
++
++from .moe_tkg import moe_tkg
++
++
++@nki.jit
++def mimo_moe_tkg_wrapper(
++    hidden_input: nl.NkiTensor,
++    expert_gate_up_weights: nl.NkiTensor,
++    expert_down_weights: nl.NkiTensor,
++    expert_affinities: nl.NkiTensor,
++    expert_index: nl.NkiTensor,
++    is_all_expert: bool,
++    rank_id: Optional[nl.NkiTensor] = None,
++    expert_gate_up_bias: Optional[nl.NkiTensor] = None,
++    expert_down_bias: Optional[nl.NkiTensor] = None,
++    expert_gate_up_weights_scale: Optional[nl.NkiTensor] = None,
++    expert_down_weights_scale: Optional[nl.NkiTensor] = None,
++    hidden_input_scale: Optional[nl.NkiTensor] = None,
++    expert_gate_up_input_scale: Optional[nl.NkiTensor] = None,
++    expert_down_input_scale: Optional[nl.NkiTensor] = None,
++    mask_unselected_experts: bool = False,
++    expert_affinities_eager: Optional[nl.NkiTensor] = None,
++    expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.NO_SCALE,
++    activation_fn: ActFnType = ActFnType.SiLU,
++    output_dtype: nki.dtype = None,
++    gate_clamp_upper_limit: Optional[float] = None,
++    gate_clamp_lower_limit: Optional[float] = None,
++    up_clamp_upper_limit: Optional[float] = None,
++    up_clamp_lower_limit: Optional[float] = None,
++    output_in_sbuf: bool = False,
++    is_all_expert_dynamic: bool = False,
++    block_size: int = None,
++    input_dequant_scale: Optional[nl.NkiTensor] = None,
++    all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED,
++):
++    """``moe_tkg_wrapper`` on the fixed vendored ``moe_tkg`` (see module docstring)."""
++    return moe_tkg(
++        hidden_input=hidden_input,
++        expert_gate_up_weights=expert_gate_up_weights,
++        expert_down_weights=expert_down_weights,
++        expert_affinities=expert_affinities,
++        expert_index=expert_index,
++        is_all_expert=is_all_expert,
++        rank_id=rank_id,
++        expert_gate_up_bias=expert_gate_up_bias,
++        expert_down_bias=expert_down_bias,
++        expert_gate_up_weights_scale=expert_gate_up_weights_scale,
++        expert_down_weights_scale=expert_down_weights_scale,
++        hidden_input_scale=hidden_input_scale,
++        expert_gate_up_input_scale=expert_gate_up_input_scale,
++        expert_down_input_scale=expert_down_input_scale,
++        mask_unselected_experts=mask_unselected_experts,
++        expert_affinities_eager=expert_affinities_eager,
++        expert_affinities_scaling_mode=expert_affinities_scaling_mode,
++        activation_fn=activation_fn,
++        output_dtype=output_dtype,
++        gate_clamp_upper_limit=gate_clamp_upper_limit,
++        gate_clamp_lower_limit=gate_clamp_lower_limit,
++        up_clamp_upper_limit=up_clamp_upper_limit,
++        up_clamp_lower_limit=up_clamp_lower_limit,
++        output_in_sbuf=output_in_sbuf,
++        is_all_expert_dynamic=is_all_expert_dynamic,
++        block_size=block_size,
++        input_dequant_scale=input_dequant_scale,
++        all_to_all_v_strategy=all_to_all_v_strategy,
++    )
+diff --git a/vllm_neuron/model/mimo_v2/nki_moe_tkg/all_expert_impl.py b/vllm_neuron/model/mimo_v2/nki_moe_tkg/all_expert_impl.py
+new file mode 100644
+index 0000000..766b9d7
+--- /dev/null
++++ b/vllm_neuron/model/mimo_v2/nki_moe_tkg/all_expert_impl.py
+@@ -0,0 +1,1598 @@
++# Vendored for MiMo-V2 (T48) from nkilib core/moe/moe_tkg/all_expert_impl.py of nki 0.7.0+37713544100.gfede04bb
++# (Neuron SDK 2.33.0 DLAMI). Only change besides the imports: see nki_moe_tkg/__init__.py.
++# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License").
++# You may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""All-expert MoE token generation implementation with static and dynamic (DLoC) dispatch."""
++
++from dataclasses import dataclass
++
++import nki.isa as nisa
++import nki.language as nl
++
++from nkilib.core.utils.allocator import SbufManager
++
++# common utils
++from nkilib.core.utils.common_types import ExpertAffinityScaleMode, GateUpDim, MoEAllToAllVStrategy, QuantizationType
++from nkilib.core.utils.kernel_assert import kernel_assert
++from nkilib.core.utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
++from nkilib.core.utils.logging import get_logger
++from nkilib.core.utils.tiled_range import TiledRange
++from nkilib.core.moe.moe_tkg.mlp_parameters import (
++    MLPBiasParameters,
++    MLPParameters,
++    MLPQuantizationParameters,
++)
++
++# MLP utils
++from nkilib.core.moe.moe_tkg.mlp_tkg_constants import MLPTKGConstants
++from .mlp_tkg_down_projection import process_down_projection
++from nkilib.core.moe.moe_tkg.mlp_tkg_gate_up_projection import process_gate_up_projection
++from nkilib.core.moe.moe_tkg.moe_tkg_utils import (
++    broadcast_all_expert_affinity,
++    get_all_expert_tile_affinities,
++    load_all_expert_affinities,
++    reshape_scale_for_mlp,
++)
++from nkilib.core.moe.moe_tkg.projection_utils import input_norm_load, transpose_store
++
++
++@dataclass
++class TokenTilingConfig(nl.NKIObject):
++    """Configuration for T-dimension tiling in all-expert MoE kernel.
++
++    Encapsulates tiling parameters to avoid mutating dims.T during iteration.
++    """
++
++    T_total: int  # Original total token count
++    tile_T: int  # Size of each tile (min(T_total, pmax))
++    num_tiles: int  # Number of T-tiles
++
++
++NUM_DYNAMIC_ALGO_STATIC_BLOCKS = 1
++NONZERO_WITH_COUNT_PAD_VAL = -1  # Pad indices with -1 to utilize DMA oob_mode.skip
++BF16_PER_INT32 = 2  # Number of bf16 elements per int32 (for token index passthrough)
++
++
++@dataclass
++class AllExpertDynamismConfig(nl.NKIObject):
++    """Dynamic control flow config for all-expert kernel."""
++
++    is_all_expert_dynamic: bool = False
++    block_size: int = None
++    all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED
++
++    def __post_init__(self):
++        """Initialize derived fields to zero; populated by derive_from_dims."""
++        self.n_blocks = 0
++        self.n_static_blocks = NUM_DYNAMIC_ALGO_STATIC_BLOCKS
++        self.n_dynamic_blocks = 0
++        self.T_plus_1 = 0
++        self.n_dynamic_blocks_plus_1 = 0
++        self.blk_tile_T = 0
++        self.blk_n_T_tiles = 0
++
++    def derive_from_dims(self, T: int):
++        """Derive dynamic tiling constants from T and block_size."""
++        pmax = nl.tile_size.pmax
++
++        self.n_blocks = T // self.block_size
++        self.n_dynamic_blocks = self.n_blocks - self.n_static_blocks
++
++        self.T_plus_1 = T + 1
++        self.n_dynamic_blocks_plus_1 = self.n_dynamic_blocks + 1
++
++        self.blk_tile_T = min(pmax, self.block_size)
++        self.blk_n_T_tiles = div_ceil(self.block_size, pmax)
++
++
++def _init_dynamism_config(params: MLPParameters) -> AllExpertDynamismConfig:
++    """Extract dynamism config from MLPParameters."""
++    T = params.batch_size * params.sequence_len
++    cfg = AllExpertDynamismConfig(
++        is_all_expert_dynamic=params.expert_params.is_all_expert_dynamic,
++        block_size=params.expert_params.block_size if params.expert_params.block_size is not None else T,
++        all_to_all_v_strategy=params.expert_params.all_to_all_v_strategy,
++    )
++    if cfg.all_to_all_v_strategy != MoEAllToAllVStrategy.DISABLED:
++        cfg.n_static_blocks = 0
++    if cfg.is_all_expert_dynamic:
++        cfg.derive_from_dims(T)
++    return cfg
++
++
++def _create_token_tiling_config(dims) -> TokenTilingConfig:
++    """Create TokenTilingConfig from MLPTKGConstants dimensions."""
++    T_total = dims.T
++    # LHS/RHS swap path places T in the free dimension (psum_fmax),
++    # but the down projection packs H1_shard tiles into PSUM banks,
++    # constraining T to: psum_fmax // ceil(H1_shard / psum_bmax).
++    pmax = dims._pmax
++    psum_fmax = dims._psum_fmax
++    psum_bmax = dims._psum_bmax
++    min_perBankT = div_ceil(dims.H1_shard, psum_bmax)
++    tile_limit = psum_fmax // max(min_perBankT, 1)
++    tile_limit = min(tile_limit, psum_fmax)
++    # Round down to multiple of pmax so affinity chunking aligns cleanly
++    tile_limit = (tile_limit // pmax) * pmax
++    tile_limit = max(tile_limit, pmax)  # at least pmax
++    tile_T = min(T_total, tile_limit)
++    num_tiles = div_ceil(T_total, tile_limit)
++    return TokenTilingConfig(T_total=T_total, tile_T=tile_T, num_tiles=num_tiles)
++
++
++def _extract_a2av_affinities(hidden_input, H, E_L, T, pmax):
++    """Extract expert affinities from concatenated A2AV input buffer.
++
++    Input layout: [T, H + E_L + 2] in bf16.
++    Affinities are at columns [H : H+E_L], shape [T, E_L].
++
++    Returns:
++        expert_affinities_hbm (nl.NkiTensor): [T, E_L] affinities in private HBM.
++    """
++    expert_affinities_hbm = nl.ndarray((T, E_L), dtype=hidden_input.dtype, buffer=nl.private_hbm)
++    # Copy affinity columns from concatenated input to separate HBM buffer
++    nisa.dma_copy(
++        src=hidden_input[:T, nl.ds(H, E_L)],
++        dst=expert_affinities_hbm,
++    )
++    return expert_affinities_hbm
++
++
++def _copy_a2av_token_indices_to_output(hidden_input, output, H, E_L, T, strategy):
++    """Copy token indices from A2AV input to output buffer.
++
++    Input token_index at columns [H+E_L : H+E_L+2] (int32 as 2xbf16).
++    Output token_index at columns [H : H+2] (appended after hidden output).
++
++    For PRESERVE_ROW_ORDER: direct copy of all T rows (both NCs shard on T).
++    For PACK_OUTPUT_ROWS: deferred — indices are scattered during output write.
++    """
++    if strategy == MoEAllToAllVStrategy.PRESERVE_ROW_ORDER:
++        _, n_prgs, prg_id = _get_program_sharding_info()
++        T_local = T // n_prgs
++        T_offset = prg_id * T_local
++        nisa.dma_copy(
++            src=hidden_input[nl.ds(T_offset, T_local), nl.ds(H + E_L, BF16_PER_INT32)],
++            dst=output[nl.ds(T_offset, T_local), nl.ds(H, BF16_PER_INT32)],
++        )
++
++
++def _get_program_sharding_info():
++    """Get verified program sharding info for LNC-2."""
++    return get_verified_program_sharding_info()
++
++
++def _build_pack_output_indices(expert_affinities, T, E, pmax, dynamism_cfg, hidden_input, output, H):
++    """Build packed output index mapping for PACK_OUTPUT_ROWS with E>1.
++
++    Finds all tokens routed to ANY expert (nonzero affinity in any column),
++    builds output_indices_hbm[routed_pos] = packed_pos, and copies token indices
++    to packed output positions.
++
++    Args:
++        expert_affinities (nl.NkiTensor): [T, E] affinities in HBM.
++        T: Total tokens.
++        E: Number of local experts.
++        pmax: Partition max.
++        dynamism_cfg: Dynamism config.
++        hidden_input (nl.NkiTensor): [T, H+E+2] concatenated input in HBM.
++        output (nl.NkiTensor): [T, H+2] output in HBM.
++        H: Hidden dimension.
++
++    Returns:
++        output_indices_hbm (nl.NkiTensor): [T, 1] in private HBM. Maps routed input position → packed output row.
++    """
++    tile_T = dynamism_cfg.blk_tile_T
++    n_T_tiles = dynamism_cfg.blk_n_T_tiles
++    if T > pmax:
++        tile_T = pmax
++        n_T_tiles = div_ceil(T, pmax)
++
++    # Step 1: Sum affinities across experts to find tokens routed to ANY expert
++    # Load [T, E] affinities, reduce across E to get [1, T] indicator
++    aff_sum_sb = nl.ndarray((pmax, T), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.memset(aff_sum_sb, 0)
++    for e in range(E):
++        expert_aff_sb = nl.ndarray((1, T), dtype=expert_affinities.dtype, buffer=nl.sbuf)
++        src_view = expert_affinities.select(dim=1, index=e).expand_dim(dim=1).expand_dim(dim=1).expand_dim(dim=1)
++        dst_view = expert_aff_sb.expand_dim(dim=1).expand_dim(dim=1)
++        nisa.dma_transpose(src=src_view, dst=dst_view)
++        # Accumulate absolute value (affinity can be negative)
++        aff_abs_sb = nl.ndarray((1, T), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_scalar(data=expert_aff_sb, op0=nl.abs, operand0=0, dst=aff_abs_sb)
++        nisa.tensor_tensor(data1=aff_sum_sb[0, :T], data2=aff_abs_sb[0, :T], op=nl.add, dst=aff_sum_sb[0, :T])
++
++    # Step 2: nonzero_with_count on the sum to find all routed positions
++    routed_indices_sb = nl.ndarray((pmax, T + 1), dtype=nl.int32, buffer=nl.sbuf)
++    nisa.nonzero_with_count(src=aff_sum_sb[...], padding_val=NONZERO_WITH_COUNT_PAD_VAL, dst=routed_indices_sb[...])
++
++    # Step 3: Build output_indices_hbm: scatter iota into HBM at routed positions
++    # output_indices_hbm[routed_indices[i]] = i (packed position)
++    output_indices_hbm = nl.ndarray((T, 1), dtype=nl.int32, buffer=nl.private_hbm)
++    # Init to -1 so unrouted positions produce OOB (skipped by oob_mode.skip downstream)
++    neg_one_sb = nl.ndarray((tile_T, 1), dtype=nl.int32, buffer=nl.sbuf)
++    nisa.memset(neg_one_sb, NONZERO_WITH_COUNT_PAD_VAL)
++    for t_idx in range(n_T_tiles):
++        t_actual = min(tile_T, T - t_idx * tile_T)
++        nisa.dma_copy(src=neg_one_sb[:t_actual, :], dst=output_indices_hbm[nl.ds(t_idx * tile_T, t_actual), :])
++
++    iota_sb = nl.ndarray((tile_T, n_T_tiles), dtype=nl.int32, buffer=nl.sbuf)
++    nisa.iota(dst=iota_sb, pattern=[[tile_T, n_T_tiles]], offset=0, channel_multiplier=1)
++
++    # Transpose routed_indices to [tile_T, n_T_tiles] for use as vector_offset
++    routed_T_psum = nl.ndarray((tile_T, n_T_tiles), dtype=nl.float32, buffer=nl.psum)
++    routed_T_sb = nl.ndarray((tile_T, n_T_tiles), dtype=nl.float32, buffer=nl.sbuf)
++    for t_idx in range(n_T_tiles):
++        nisa.nc_transpose(
++            data=routed_indices_sb.view(nl.float32)[0, nl.ds(tile_T * t_idx, tile_T)],
++            dst=routed_T_psum[:, t_idx],
++        )
++    nisa.tensor_copy(src=routed_T_psum, dst=routed_T_sb)
++    routed_T_int32_sb = routed_T_sb.view(nl.int32)
++
++    for t_idx in range(n_T_tiles):
++        nisa.dma_copy(
++            src=iota_sb[:, t_idx : t_idx + 1],
++            dst=output_indices_hbm.ap(
++                pattern=[[1, tile_T], [1, 1]],
++                offset=0,
++                vector_offset=routed_T_int32_sb.ap(
++                    pattern=[[n_T_tiles, tile_T], [1, 1]],
++                    offset=t_idx,
++                ),
++                indirect_dim=0,
++            ),
++            oob_mode=nisa.oob_mode.skip,
++            dge_mode=nisa.dge_mode.swdge,
++        )
++
++    # Step 4: Copy token indices from input to packed output positions
++    _, n_prgs, prg_id = _get_program_sharding_info()
++    input_row_stride = hidden_input.shape[-1]
++    E_L = E
++    for t_idx in range(n_T_tiles):
++        tile_T_actual = min(tile_T, T - t_idx * tile_T)
++        token_idx_tile_sb = nl.ndarray((tile_T, BF16_PER_INT32), dtype=hidden_input.dtype, buffer=nl.sbuf)
++        nisa.memset(token_idx_tile_sb, 0)
++        # Gather token indices from input at routed positions
++        nisa.dma_copy(
++            src=hidden_input.ap(
++                pattern=[[input_row_stride, tile_T], [1, BF16_PER_INT32]],
++                offset=H + E_L,
++                vector_offset=routed_T_int32_sb.ap(
++                    pattern=[[n_T_tiles, tile_T], [1, 1]],
++                    offset=t_idx,
++                ),
++                indirect_dim=0,
++            ),
++            dst=token_idx_tile_sb[:tile_T_actual, :BF16_PER_INT32],
++            oob_mode=nisa.oob_mode.skip,
++            dge_mode=nisa.dge_mode.swdge,
++        )
++        # Write to packed output positions (sequential since iota ordering)
++        if prg_id == 0:
++            nisa.dma_copy(
++                src=token_idx_tile_sb[:tile_T_actual, :BF16_PER_INT32],
++                dst=output[nl.ds(t_idx * tile_T, tile_T_actual), nl.ds(H, BF16_PER_INT32)],
++            )
++
++    return output_indices_hbm
++
++
++def _all_expert_moe_tkg(
++    params: MLPParameters,
++    output: nl.NkiTensor,
++) -> nl.NkiTensor:
++    """
++    All-expert MoE kernel for token generation (TKG). Dispatches to static or dynamic implementation.
++
++    Args:
++        params (MLPParameters): MLPParameters containing model configuration, weights, and input tensors.
++        output (nl.NkiTensor): Output tensor to store the final result.
++
++    Returns:
++        output (nl.NkiTensor): Output tensor with accumulated expert results.
++    """
++    dynamism_cfg = _init_dynamism_config(params)
++
++    if dynamism_cfg.is_all_expert_dynamic:
++        return _all_expert_moe_tkg_dynamic(params, dynamism_cfg, output)
++    else:
++        return _all_expert_moe_tkg_static(params, output)
++
++
++def _all_expert_moe_tkg_dynamic(
++    params: MLPParameters,
++    dynamism_cfg: AllExpertDynamismConfig,
++    output: nl.NkiTensor,
++) -> nl.NkiTensor:
++    """
++    All-expert MoE with dynamic control flow (DLoC).
++
++    For each expert, finds routed tokens via nonzero_with_count, then processes
++    static blocks (always executed) and dynamic blocks (skipped at runtime if
++    no routed tokens remain). Each block gathers input by token indices, computes
++    the expert MLP, and scatters output back to HBM.
++
++    Currently restricted to E == 1 (single local expert after expert parallelism),
++    matching the MX dynamic path constraint.
++
++    Args:
++        params (MLPParameters): MLPParameters containing model configuration, weights, and input tensors.
++        dynamism_cfg (AllExpertDynamismConfig): Dynamic control flow configuration.
++        output (nl.NkiTensor): Output tensor [T, H] in HBM.
++
++    Returns:
++        output (nl.NkiTensor): Output tensor with accumulated expert results.
++    """
++    io_dtype = params.hidden_tensor.dtype
++    expert_affinities = params.expert_params.expert_affinities
++
++    kernel_assert(
++        not (params.use_tkg_gate_up_proj_column_tiling or params.use_tkg_down_proj_column_tiling),
++        "Column tiling is not supported in all-expert dynamic MLP kernel",
++    )
++    kernel_assert(
++        params.hidden_tensor.buffer != nl.sbuf,
++        "Dynamic all-expert MoE TKG requires hidden input in HBM",
++    )
++    kernel_assert(
++        output.buffer != nl.sbuf,
++        "Dynamic all-expert MoE TKG requires output in HBM",
++    )
++
++    dims = MLPTKGConstants.calculate_constants(params)
++
++    T = dims.T
++    H = dims.H
++    pmax = dims._pmax
++
++    # A2AV setup: extract affinities from concatenated input and copy token indices to output
++    a2av_enabled = dynamism_cfg.all_to_all_v_strategy != MoEAllToAllVStrategy.DISABLED
++    output_indices_hbm = None
++    if a2av_enabled:
++        E_L = dims.E
++        expert_affinities = _extract_a2av_affinities(params.hidden_tensor, H, E_L, T, pmax)
++        if dims.E > 1 and dynamism_cfg.all_to_all_v_strategy == MoEAllToAllVStrategy.PACK_OUTPUT_ROWS:
++            # E>1 PACK_OUTPUT_ROWS: build packed index mapping and copy token indices to packed positions
++            output_indices_hbm = _build_pack_output_indices(
++                expert_affinities,
++                T,
++                E_L,
++                pmax,
++                dynamism_cfg,
++                params.hidden_tensor,
++                output,
++                H,
++            )
++        else:
++            _copy_a2av_token_indices_to_output(
++                params.hidden_tensor,
++                output,
++                H,
++                E_L,
++                T,
++                dynamism_cfg.all_to_all_v_strategy,
++            )
++
++    # For A2AV, input row stride is H_concat (H + E_L + 2); otherwise it's H
++    input_row_stride = params.hidden_tensor.shape[-1] if a2av_enabled else None
++
++    use_auto_alloc = H >= 16 * 1024
++    sbm = SbufManager(0, 200000, get_logger("all_expert_moe_tkg_dynamic"), use_auto_alloc=use_auto_alloc)
++    sbm.open_scope()
++    allocator = sbm.alloc_stack
++
++    # Pre-allocate projection buffers outside dynamic loops to avoid NCC_IGCA108
++    # (compiler requires tensors with loop-carried dependency to be defined outside of loop)
++    block_T = dynamism_cfg.block_size
++    num_I_tiles = div_ceil(dims.I, dims.I0)
++    prealloc_gate_up_sb = nl.ndarray((dims.I0, num_I_tiles, block_T), dtype=nl.float32, buffer=nl.sbuf)
++    prealloc_gate_up_sb_casted = nl.ndarray((dims.I0, num_I_tiles, block_T), dtype=io_dtype, buffer=nl.sbuf)
++    # Internal gate/up projection accumulation buffers
++    gate_up_proj_tile_shape = (dims.I0, num_I_tiles, block_T)
++    prealloc_gate_sb_fp32 = nl.ndarray(gate_up_proj_tile_shape, dtype=nl.float32, buffer=nl.sbuf)
++    prealloc_up_sb_fp32 = nl.ndarray(gate_up_proj_tile_shape, dtype=nl.float32, buffer=nl.sbuf)
++    prealloc_gate_up_buffers = (prealloc_gate_sb_fp32, prealloc_up_sb_fp32)
++
++    # Save original tensors before expert loop (params is mutated by _select_expert_params)
++    gate_proj_weights = params.gate_proj_weights_tensor
++    up_proj_weights = params.up_proj_weights_tensor
++    down_proj_weights = params.down_proj_weights_tensor
++    gate_proj_bias = params.bias_params.gate_proj_bias_tensor
++    up_proj_bias = params.bias_params.up_proj_bias_tensor
++    down_proj_bias = params.bias_params.down_proj_bias_tensor
++    gate_w_scale = params.quant_params.gate_w_scale
++    up_w_scale = params.quant_params.up_w_scale
++    down_w_scale = params.quant_params.down_w_scale
++    gate_up_in_scale = params.quant_params.gate_up_in_scale
++    down_in_scale = params.quant_params.down_in_scale
++
++    # Zero-initialize output buffer: each NC memsets its own [T, H_per_shard] slice
++    # For PACK_OUTPUT_ROWS: ensures padding positions beyond routed tokens are deterministic
++    # For PRESERVE_ROW_ORDER: ensures unrouted token positions are zero for correct combine-sum
++    H_per_shard = dims.H_per_shard
++    h_offset = dims.H1_offset * dims.H0
++    zero_tile_T = min(pmax, T)
++    zero_sb = nl.ndarray((zero_tile_T, H_per_shard), dtype=io_dtype, buffer=nl.sbuf)
++    nisa.memset(zero_sb, 0)
++    for t_start in range(0, T, zero_tile_T):
++        tile_T_actual = min(zero_tile_T, T - t_start)
++        nisa.dma_copy(
++            src=zero_sb[:tile_T_actual, :H_per_shard],
++            dst=output[nl.ds(t_start, tile_T_actual), nl.ds(h_offset, H_per_shard)],
++        )
++
++    # For PACK_OUTPUT_ROWS with E=1, track write position for sequential output.
++    # For E>1, we use scatter (same as PRESERVE_ROW_ORDER) since packing is only valid for single expert.
++    write_offset = None
++    if dynamism_cfg.all_to_all_v_strategy == MoEAllToAllVStrategy.PACK_OUTPUT_ROWS and dims.E == 1:
++        write_offset = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
++        nisa.memset(write_offset, 0)
++
++    # Process each expert
++    for expertIdx in nl.sequential_range(dims.E):
++        sbm.set_name_prefix(f"expert{expertIdx}_")
++
++        # Select weights for this expert
++        _select_expert_params(
++            params,
++            expertIdx,
++            gate_proj_weights,
++            up_proj_weights,
++            down_proj_weights,
++            gate_proj_bias,
++            up_proj_bias,
++            down_proj_bias,
++            gate_w_scale,
++            up_w_scale,
++            down_w_scale,
++            gate_up_in_scale,
++            down_in_scale,
++        )
++
++        # Find routed tokens and build dynamic decision vector
++        routed_token_indices_sb, dynamic_decision_sb = _find_routed_tokens(
++            expert_affinities=expert_affinities,
++            expert_idx=expertIdx,
++            T=T,
++            pmax=pmax,
++            dynamism_cfg=dynamism_cfg,
++        )
++
++        # Process static blocks
++        for static_block_idx in nl.sequential_range(dynamism_cfg.n_static_blocks):
++            _compute_dynamic_block(
++                params=params,
++                dims=dims,
++                dynamism_cfg=dynamism_cfg,
++                io_dtype=io_dtype,
++                routed_token_indices=routed_token_indices_sb,
++                expert_affinities=expert_affinities,
++                expert_idx=expertIdx,
++                block_idx=static_block_idx,
++                output_hbm=output,
++                is_dynamic_block=False,
++                input_row_stride=input_row_stride,
++                write_offset=write_offset,
++                is_first_expert=(expertIdx == 0),
++                output_indices_hbm=output_indices_hbm,
++            )
++
++        # Move dynamic block indices to HBM for indirect access
++        dynamic_block_token_indices_hbm = _init_dynamic_indices_hbm(
++            dynamism_cfg=dynamism_cfg,
++            routed_token_indices_sb=routed_token_indices_sb,
++            dynamic_decision_sb=dynamic_decision_sb,
++        )
++
++        # Dynamic loop: sum decision vector to get total dynamic block count, then iterate
++        n_dynamic_blocks_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
++        nisa.tensor_reduce(dst=n_dynamic_blocks_sb, data=dynamic_decision_sb, op=nl.add, axis=1)
++        n_dynamic_blocks_reg = nisa.register_alloc()
++        nisa.register_load(src=n_dynamic_blocks_sb, dst=n_dynamic_blocks_reg)
++
++        dynamic_block_idx = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
++        nisa.memset(dynamic_block_idx, 0)
++
++        def _dynamic_block_body(_):
++            _compute_dynamic_block(
++                params=params,
++                dims=dims,
++                dynamism_cfg=dynamism_cfg,
++                io_dtype=io_dtype,
++                routed_token_indices=dynamic_block_token_indices_hbm,
++                expert_affinities=expert_affinities,
++                expert_idx=expertIdx,
++                block_idx=dynamic_block_idx,
++                output_hbm=output,
++                is_dynamic_block=True,
++                input_row_stride=input_row_stride,
++                write_offset=write_offset,
++                is_first_expert=(expertIdx == 0),
++                output_indices_hbm=output_indices_hbm,
++                prealloc_gate_up_sb=prealloc_gate_up_sb,
++                prealloc_gate_up_sb_casted=prealloc_gate_up_sb_casted,
++                prealloc_gate_up_buffers=prealloc_gate_up_buffers,
++            )
++
++            # Advance to next dynamic block
++            nisa.tensor_scalar(data=dynamic_block_idx, op0=nl.add, operand0=1, dst=dynamic_block_idx)
++
++        nl.fori_loop(0, n_dynamic_blocks_reg, _dynamic_block_body)
++
++    sbm.close_scope()
++    return output
++
++
++def _all_expert_moe_tkg_static(
++    params: MLPParameters,
++    output: nl.NkiTensor,
++) -> nl.NkiTensor:
++    """
++    Static all-expert MoE computation without dynamic loop on chip (DLoC).
++
++    Processes all experts sequentially, computing MLP projections for each expert
++    and accumulating results weighted by expert affinities.
++
++    Supports T > 128 via T-tiling: when T exceeds pmax (128), the token dimension
++    is processed in tiles of pmax, with each tile going through all experts before
++    storing results and moving to the next tile.
++
++    Args:
++        params (MLPParameters): MLPParameters containing model configuration, weights, and input tensors.
++        output (nl.NkiTensor): Output tensor to store the final result.
++
++    Returns:
++        output (nl.NkiTensor): Output tensor with accumulated expert results.
++
++    Notes:
++        - Column tiling for down projection is not supported.
++
++    Pseudocode:
++        output_sb[tile_T, num_T_tiles, H] = zeros()
++
++        for expert_idx in range(E):
++            weights = load_expert_weights(expert_idx)
++            for t_tile in range(num_T_tiles):
++                input_sb[H0, tile_T, H1] = load(hidden_tensor[t_offset:t_offset+tile_T, H])
++                gate_up[I0, I1, tile_T] = gate_up_proj(input_sb, weights)
++                down[H0, H1_shard, tile_T] = down_proj(gate_up, weights)
++                if POST_SCALE: down *= affinity
++                output_sb[:, t_tile, :] += transpose(down)
++
++        for t_tile in range(num_T_tiles):
++            output[t_offset:t_offset+tile_T, H] = output_sb[:, t_tile, :]
++    """
++    io_dtype = params.hidden_tensor.dtype
++    expert_affinities = params.expert_params.expert_affinities
++    expert_affinities_in_sbuf = expert_affinities.buffer == nl.sbuf
++
++    if (
++        params.use_tkg_down_proj_column_tiling
++    ):  # pragma: no cover - validation guard; column tiling is unsupported in all-expert MLP
++        kernel_assert(False, "Column tiling for down proj is not supported in all-expert MLP kernel")
++
++    hidden_in_sbuf = params.hidden_tensor.buffer == nl.sbuf
++
++    dims = MLPTKGConstants.calculate_constants(params)
++
++    # Create T-tiling config (preserves original dims.T, avoids mutation)
++    t_cfg = _create_token_tiling_config(dims)
++
++    kernel_assert(
++        not hidden_in_sbuf or params.hidden_tensor.shape[1] == t_cfg.T_total,
++        f"SBUF input shape mismatch: expected T dim={t_cfg.T_total}, got {params.hidden_tensor.shape[1]}",
++    )
++
++    H = params.hidden_tensor.shape[-1]
++    # Note: always use auto allocation since expert_affinities is always in SBUF
++    use_auto_alloc = H >= 16 * 1024 or hidden_in_sbuf or expert_affinities_in_sbuf
++    sbm = SbufManager(0, 200000, get_logger("all_expert_moe_tkg"), use_auto_alloc=use_auto_alloc)
++
++    sbm.open_scope()
++    allocator = sbm.alloc_stack
++
++    # Save original tensors before expert loop (params is mutated by _select_expert_params)
++    hidden_tensor = params.hidden_tensor
++    gate_proj_weights = params.gate_proj_weights_tensor
++    up_proj_weights = params.up_proj_weights_tensor
++    down_proj_weights = params.down_proj_weights_tensor
++
++    gate_proj_bias = params.bias_params.gate_proj_bias_tensor
++    up_proj_bias = params.bias_params.up_proj_bias_tensor
++    down_proj_bias = params.bias_params.down_proj_bias_tensor
++
++    gate_w_scale = params.quant_params.gate_w_scale
++    up_w_scale = params.quant_params.up_w_scale
++    down_w_scale = params.quant_params.down_w_scale
++    gate_up_in_scale = params.quant_params.gate_up_in_scale
++    down_in_scale = params.quant_params.down_in_scale
++
++    # Allocate accumulation buffer [H0, H1_shard, tile_T * num_tiles]
++    output_temp = allocator((dims.H0, dims.H1_shard, t_cfg.tile_T * t_cfg.num_tiles), dtype=io_dtype, buffer=nl.sbuf)
++    output_in_sbuf = (output.buffer == nl.sbuf) if isinstance(output, nl.NkiTensor) else output.buffer == nl.sbuf
++
++    # Load expert affinities for all T-tiles upfront
++    pmax = dims._pmax
++    expert_affinities_sb, aff_num_tiles = load_all_expert_affinities(
++        expert_affinities, expert_affinities_in_sbuf, t_cfg.T_total, dims, allocator
++    )
++
++    memory_safe_degree = 2 if t_cfg.tile_T * dims.H * dims.I <= 32 * 3072 * 1024 else 1
++
++    # Pre-load identity matrix (reused across all experts, only for T <= pmax)
++    pmax = dims._pmax
++    identity_sb = nl.shared_identity_matrix(t_cfg.tile_T, dtype=io_dtype) if t_cfg.tile_T <= pmax else None
++
++    # Pre-load all input tiles (reused across all experts, avoids redundant DMA per expert)
++    if hidden_in_sbuf:
++        input_sb_tiles = None
++    else:
++        input_sb_tiles = []
++        for t_tile in TiledRange(t_cfg.T_total, t_cfg.tile_T):
++            dims.T = t_tile.size  # Temporarily set for input_norm_load
++            isb = allocator(
++                [dims.H0, t_tile.size, dims.H1_shard],
++                dtype=io_dtype,
++                buffer=nl.sbuf,
++                name=f"input_sb_t{t_tile.index}",
++            )
++            input_norm_load(hidden_tensor, isb, params, dims, sbm=sbm, T_offset=t_tile.start_offset)
++            input_sb_tiles.append(isb)
++
++    # E-then-T: outer loop over experts (load weights once), inner loop over T-tiles
++    for expertIdx in range(dims.E):
++        sbm.set_name_prefix(f"expert{expertIdx}_")
++
++        # Select weights, biases, and quant scales for this expert
++        _select_expert_params(
++            params,
++            expertIdx,
++            gate_proj_weights,
++            up_proj_weights,
++            down_proj_weights,
++            gate_proj_bias,
++            up_proj_bias,
++            down_proj_bias,
++            gate_w_scale,
++            up_w_scale,
++            down_w_scale,
++            gate_up_in_scale,
++            down_in_scale,
++        )
++
++        # Inner loop over T-tiles for this expert
++        sbm.open_scope(interleave_degree=memory_safe_degree)
++        for t_tile in TiledRange(t_cfg.T_total, t_cfg.tile_T):
++            current_tile_T = t_tile.size
++            t_offset = t_tile.start_offset
++            t_idx = t_tile.index
++            sbm.set_name_prefix(f"expert{expertIdx}_t{t_idx}_")
++
++            dims.T = current_tile_T  # Temporarily set for sub-kernels
++
++            # Use pre-loaded input for this T-tile
++            if hidden_in_sbuf:
++                input_sb = hidden_tensor
++            else:
++                input_sb = input_sb_tiles[t_idx]
++
++            _compute_expert_mlp_tkg(
++                input_sb=input_sb,
++                params=params,
++                dims=dims,
++                sbm=sbm,
++                allocator=allocator,
++                expert_affinities_sb=expert_affinities_sb,
++                aff_num_tiles=aff_num_tiles,
++                identity_sb=identity_sb,
++                use_auto_alloc=use_auto_alloc,
++                io_dtype=io_dtype,
++                output_temp=output_temp,
++                expertIdx=expertIdx,
++                t_offset=t_offset,
++                t_idx=t_idx,
++                t_cfg=t_cfg,
++                current_tile_T=current_tile_T,
++                hidden_in_sbuf=hidden_in_sbuf,
++            )
++
++            sbm.increment_section()
++        sbm.close_scope()
++
++    # Store: transpose [H0, H1_shard, T] to [T, H] and write to HBM
++    # transpose_store requires T <= pmax, so tile in pmax-sized chunks
++    store_tile_T = min(t_cfg.T_total, pmax)
++    if output_in_sbuf:
++        for t_tile in TiledRange(t_cfg.T_total, store_tile_T):
++            t_free_offset = t_tile.start_offset  # offset into output_temp's free dim
++            for h1 in range(dims.H1_shard):
++                nisa.tensor_copy(
++                    dst=output[:, nl.ds(t_tile.start_offset, t_tile.size), h1],
++                    src=output_temp[:, h1, nl.ds(t_free_offset, t_tile.size)],
++                )
++    elif params.transposed_out:
++        for t_tile in TiledRange(t_cfg.T_total, t_cfg.tile_T):
++            t_free_offset = t_tile.index * t_cfg.tile_T
++            tile_nc_size = dims.H1_shard * t_tile.size
++            full_nc_size = dims.H1_shard * t_cfg.T_total
++            nc_offset = dims.shard_id * full_nc_size + dims.H1_shard * t_tile.start_offset
++            nisa.dma_copy(
++                dst=output.reshape((dims.H0, dims.num_shards * full_nc_size))[:, nc_offset : nc_offset + tile_nc_size],
++                src=output_temp[: dims.H0, : dims.H1_shard, nl.ds(t_free_offset, t_tile.size)].reshape(
++                    (dims.H0, tile_nc_size)
++                ),
++            )
++    else:
++        for t_tile in TiledRange(t_cfg.T_total, store_tile_T):
++            sbm.set_name_prefix(f"store_t{t_tile.index}_")
++            t_free_offset = t_tile.start_offset
++            dims.T = t_tile.size  # Temporarily set for transpose_store
++            transpose_store(
++                output_temp[: dims.H0, : dims.H1_shard, nl.ds(t_free_offset, t_tile.size)],
++                output,
++                dims,
++                params.output_dtype,
++                sbm,
++                T_offset=t_tile.start_offset,
++            )
++
++    sbm.set_name_prefix("")
++
++    sbm.close_scope()
++    return output
++
++
++def _select_expert_params(
++    params,
++    expertIdx,
++    gate_proj_weights,
++    up_proj_weights,
++    down_proj_weights,
++    gate_proj_bias,
++    up_proj_bias,
++    down_proj_bias,
++    gate_w_scale,
++    up_w_scale,
++    down_w_scale,
++    gate_up_in_scale,
++    down_in_scale,
++):
++    """Select weights, biases, and quant scales for a single expert, mutating params in-place."""
++    expert_gate_w = gate_proj_weights.select(dim=0, index=expertIdx)
++    expert_up_w = up_proj_weights.select(dim=0, index=expertIdx)
++    expert_down_w = down_proj_weights.select(dim=0, index=expertIdx)
++
++    if len(expert_gate_w.shape) > 2:
++        expert_gate_w = expert_gate_w.select(dim=1, index=GateUpDim.GATE.value)
++        expert_up_w = expert_up_w.select(dim=1, index=GateUpDim.UP.value)
++
++    expert_gate_b, expert_up_b, expert_down_b = None, None, None
++    if gate_proj_bias != None:
++        expert_gate_b = gate_proj_bias.select(dim=0, index=expertIdx)
++        if len(expert_gate_b.shape) > 1:
++            expert_gate_b = expert_gate_b.select(dim=0, index=GateUpDim.GATE.value)
++    if up_proj_bias != None:
++        expert_up_b = up_proj_bias.select(dim=0, index=expertIdx)
++        if len(expert_up_b.shape) > 1:
++            expert_up_b = expert_up_b.select(dim=0, index=GateUpDim.UP.value)
++    if down_proj_bias != None:
++        expert_down_b = down_proj_bias.select(dim=0, index=expertIdx)
++
++    params.gate_proj_weights_tensor = expert_gate_w
++    params.up_proj_weights_tensor = expert_up_w
++    params.down_proj_weights_tensor = expert_down_w
++    params.bias_params = MLPBiasParameters(
++        gate_proj_bias_tensor=expert_gate_b,
++        up_proj_bias_tensor=expert_up_b,
++        down_proj_bias_tensor=expert_down_b,
++    )
++
++    if params.quant_params.quantization_type != QuantizationType.NONE:
++        params.quant_params = _select_quant_scales(
++            params.quant_params,
++            gate_w_scale,
++            up_w_scale,
++            down_w_scale,
++            gate_up_in_scale,
++            down_in_scale,
++            expertIdx,
++        )
++
++
++def _find_routed_tokens(expert_affinities, expert_idx, T, pmax, dynamism_cfg):
++    """
++    Find indices of tokens routed to a specific expert and build dynamic block decision vector.
++
++    Args:
++        expert_affinities (nl.NkiTensor): [T, E] expert affinities in HBM.
++        expert_idx: Index of the expert.
++        T: Total number of tokens.
++        pmax: Partition max size.
++        dynamism_cfg (AllExpertDynamismConfig): Dynamism parameters.
++
++    Returns:
++        routed_token_indices_sb (nl.NkiTensor): [pmax, T+1] in SBUF. Partition 0 has routed indices + count.
++        dynamic_decision_sb (nl.NkiTensor): [1, n_dynamic_blocks+1] in SBUF. Decision vector.
++    """
++    # Load expert affinities for this expert: transpose [T, E] -> [1, T]
++    expert_aff_f32_sb = nl.ndarray((pmax, T), dtype=nl.float32, buffer=nl.sbuf)
++    needs_cast = expert_affinities.dtype != nl.float32
++    if needs_cast:
++        expert_aff_sb = nl.ndarray((1, T), dtype=expert_affinities.dtype, buffer=nl.sbuf)
++        load_dst = expert_aff_sb
++    else:
++        load_dst = expert_aff_f32_sb
++
++    src_view = expert_affinities.select(dim=1, index=expert_idx).expand_dim(dim=1).expand_dim(dim=1).expand_dim(dim=1)
++    dst_view = load_dst.expand_dim(dim=1).expand_dim(dim=1)
++    nisa.dma_transpose(src=src_view, dst=dst_view)
++    if needs_cast:
++        nisa.tensor_copy(src=expert_aff_sb[...], dst=expert_aff_f32_sb[0, :])
++
++    # nonzero_with_count
++    routed_token_indices_sb = nl.ndarray((pmax, dynamism_cfg.T_plus_1), dtype=nl.int32, buffer=nl.sbuf)
++    nisa.nonzero_with_count(
++        src=expert_aff_f32_sb[...],
++        padding_val=NONZERO_WITH_COUNT_PAD_VAL,
++        dst=routed_token_indices_sb[...],
++    )
++
++    # Build dynamic decision vector: iota=[block_size*n_static, ...], less(iota, count) -> [1, 0, ...]
++    dynamic_decision_sb = nl.ndarray((1, dynamism_cfg.n_dynamic_blocks_plus_1), dtype=nl.int32, buffer=nl.sbuf)
++    count_f32 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_copy(src=routed_token_indices_sb[0, T], dst=count_f32)
++    nisa.iota(
++        dst=dynamic_decision_sb[...],
++        pattern=[[dynamism_cfg.block_size, dynamism_cfg.n_dynamic_blocks_plus_1]],
++        offset=dynamism_cfg.n_static_blocks * dynamism_cfg.block_size,
++    )
++    nisa.tensor_scalar(
++        data=dynamic_decision_sb[...],
++        op0=nl.less,
++        operand0=count_f32,
++        dst=dynamic_decision_sb[...],
++    )
++
++    return routed_token_indices_sb, dynamic_decision_sb
++
++
++def _init_dynamic_indices_hbm(dynamism_cfg, routed_token_indices_sb, dynamic_decision_sb):
++    """
++    Move routed token indices for dynamic blocks to HBM.
++
++    Returns:
++        dynamic_block_token_indices_hbm (nl.NkiTensor): [n_dynamic_blocks, block_size] in private HBM.
++    """
++    n_static_tokens = dynamism_cfg.n_static_blocks * dynamism_cfg.block_size
++    n_dynamic_tokens = dynamism_cfg.n_dynamic_blocks * dynamism_cfg.block_size
++
++    dynamic_block_token_indices_hbm = nl.ndarray(
++        (1, n_dynamic_tokens),
++        dtype=routed_token_indices_sb.dtype,
++        buffer=nl.private_hbm,
++    )
++
++    nisa.dma_copy(
++        src=routed_token_indices_sb[0, nl.ds(n_static_tokens, n_dynamic_tokens)],
++        dst=dynamic_block_token_indices_hbm[0, :],
++    )
++    dynamic_block_token_indices_hbm = dynamic_block_token_indices_hbm.reshape(
++        (dynamism_cfg.n_dynamic_blocks, dynamism_cfg.block_size)
++    )
++
++    return dynamic_block_token_indices_hbm
++
++
++def _get_block_token_indices(dynamism_cfg, routed_token_indices, block_idx, is_dynamic_block):
++    """
++    Get token indices for a block and transpose them for indirect DMA.
++
++    Args:
++        dynamism_cfg (AllExpertDynamismConfig): Dynamism parameters.
++        routed_token_indices: Static: [pmax, T+1] SBUF. Dynamic: [n_dynamic_blocks, block_size] HBM.
++        block_idx: Static: int literal. Dynamic: [1, 1] SBUF tensor.
++        is_dynamic_block (bool): Whether this is a dynamic block.
++
++    Returns:
++        token_indices_T_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles] transposed indices in SBUF (int32).
++    """
++    # Load indices to SBUF
++    if is_dynamic_block:
++        token_indices_sb = nl.ndarray((1, dynamism_cfg.block_size), dtype=nl.int32, buffer=nl.sbuf)
++        nisa.dma_copy(
++            src=routed_token_indices.ap(
++                pattern=[[dynamism_cfg.block_size, 1], [1, dynamism_cfg.block_size]],
++                offset=0,
++                scalar_offset=block_idx,
++                indirect_dim=0,
++            ),
++            dst=token_indices_sb,
++        )
++    else:
++        token_indices_sb = routed_token_indices[0, nl.ds(dynamism_cfg.block_size * block_idx, dynamism_cfg.block_size)]
++
++    # Transpose indices: [1, block_size] -> [blk_tile_T, blk_n_T_tiles]
++    # Reinterpret int32 as float32 since PE transpose doesn't support int32
++    token_indices_sb = token_indices_sb.view(nl.float32)
++    token_indices_T_psum = nl.ndarray(
++        (dynamism_cfg.blk_tile_T, dynamism_cfg.blk_n_T_tiles),
++        dtype=nl.float32,
++        buffer=nl.psum,
++    )
++    token_indices_T_sb = nl.ndarray(
++        (dynamism_cfg.blk_tile_T, dynamism_cfg.blk_n_T_tiles),
++        dtype=nl.float32,
++        buffer=nl.sbuf,
++    )
++    for tile_out in range(dynamism_cfg.blk_n_T_tiles):
++        nisa.nc_transpose(
++            data=token_indices_sb[0, nl.ds(dynamism_cfg.blk_tile_T * tile_out, dynamism_cfg.blk_tile_T)],
++            dst=token_indices_T_psum[:, tile_out],
++        )
++    nisa.tensor_copy(src=token_indices_T_psum[...], dst=token_indices_T_sb[...])
++    token_indices_T_sb = token_indices_T_sb.view(nl.int32)
++
++    return token_indices_T_sb
++
++
++def _gather_input_block(hidden_input, token_indices_T_sb, dims, dynamism_cfg, io_dtype, sbm, input_row_stride=None):
++    """
++    Gather input hidden states for a block of tokens via indirect DMA.
++
++    Loads from [T, H] or [T, H_concat] HBM into [H0, block_T, H1_shard] SBUF layout using
++    indirect DMA gather + on-chip transpose.
++
++    Args:
++        hidden_input (nl.NkiTensor): [T, H] or [T, H_concat] input in HBM.
++        token_indices_T_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles] transposed token indices.
++        dims: MLPTKGConstantsDimensionSizes.
++        dynamism_cfg (AllExpertDynamismConfig): Dynamism parameters.
++        io_dtype: Data type.
++        sbm (SbufManager): SBUF manager.
++        input_row_stride (int): Row stride of hidden_input. Defaults to dims.H.
++
++    Returns:
++        input_sb (nl.NkiTensor): [H0, block_T, H1_shard] in SBUF.
++    """
++    block_T = dynamism_cfg.block_size
++    H0 = dims.H0  # pmax = 128
++    H1_shard = dims.H1_shard
++    H_per_shard = dims.H_per_shard
++    shard_id = dims.shard_id
++    h_offset = dims.H1_offset * H0
++    row_stride = input_row_stride if input_row_stride is not None else dims.H
++
++    input_sb = nl.ndarray((H0, block_T, H1_shard), dtype=io_dtype, buffer=nl.sbuf)
++    # Zero-init ensures unrouted token positions (skipped by oob_mode.skip) produce
++    # deterministic zeros through the MLP, avoiding non-determinism from uninitialized SBUF.
++    nisa.memset(input_sb, 0)
++
++    # Indirect DMA: gather [block_T, H_per_shard] from [T, H] HBM
++    # Then transpose on-chip to [H0, block_T, H1_shard]
++    for tile_t in range(dynamism_cfg.blk_n_T_tiles):
++        tile_T_actual = min(dynamism_cfg.blk_tile_T, block_T - tile_t * dynamism_cfg.blk_tile_T)
++        # Load [blk_tile_T, H_per_shard] via indirect DMA
++        input_tile_sb = nl.ndarray((tile_T_actual, H_per_shard), dtype=io_dtype, buffer=nl.sbuf)
++        nisa.dma_copy(
++            src=hidden_input.ap(
++                pattern=[[row_stride, dynamism_cfg.blk_tile_T], [1, H_per_shard]],
++                offset=h_offset,
++                vector_offset=token_indices_T_sb.ap(
++                    pattern=[[dynamism_cfg.blk_n_T_tiles, dynamism_cfg.blk_tile_T], [1, 1]],
++                    offset=tile_t,
++                ),
++                indirect_dim=0,
++            ),
++            dst=input_tile_sb[:tile_T_actual, :H_per_shard],
++            oob_mode=nisa.oob_mode.skip,
++            dge_mode=nisa.dge_mode.swdge,
++        )
++        # Transpose [tile_T_actual, H_per_shard] -> [H0, tile_T_actual, H1_shard]
++        # HBM layout: hidden[t, h0*H1_shard + h1] (H0 outer, H1_shard inner)
++        # Reshape to [T, H0, H1_shard], then transpose [T, H0] -> [H0, T] per H1 slice
++        input_tile_reshaped = input_tile_sb.reshape((tile_T_actual, H0, H1_shard))
++        for h1_idx in range(H1_shard):
++            tp_psum = nl.ndarray((H0, tile_T_actual), dtype=io_dtype, buffer=nl.psum)
++            nisa.nc_transpose(
++                data=input_tile_reshaped[:tile_T_actual, :H0, h1_idx],
++                dst=tp_psum[:H0, :tile_T_actual],
++            )
++            t_offset = tile_t * dynamism_cfg.blk_tile_T
++            nisa.tensor_copy(
++                dst=input_sb[:H0, nl.ds(t_offset, tile_T_actual), h1_idx],
++                src=tp_psum[:H0, :tile_T_actual],
++            )
++
++    return input_sb
++
++
++def _scatter_output_block(
++    output_sb,
++    output_hbm,
++    token_indices_T_sb,
++    dims,
++    dynamism_cfg,
++    io_dtype,
++    output_row_stride=None,
++    is_first_expert=True,
++):
++    """
++    Transpose block output from [H0, H1_shard, block_T] to [block_T, H] and scatter to HBM.
++
++    Args:
++        output_sb (nl.NkiTensor): [H0, H1_shard, block_T] expert MLP output in SBUF.
++        output_hbm (nl.NkiTensor): [T, H] or [T, H+2] output in HBM.
++        token_indices_T_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles] transposed token indices.
++        dims: MLPTKGConstantsDimensionSizes.
++        dynamism_cfg (AllExpertDynamismConfig): Dynamism parameters.
++        io_dtype: Data type.
++        output_row_stride (int): Row stride of output_hbm. Defaults to dims.H.
++        is_first_expert (bool): If True, overwrite output. If False, accumulate via atomic add.
++    """
++    block_T = dynamism_cfg.block_size
++    H0 = dims.H0
++    H1_shard = dims.H1_shard
++    H_per_shard = dims.H_per_shard
++    shard_id = dims.shard_id
++    h_offset = dims.H1_offset * H0
++    row_stride = output_row_stride if output_row_stride is not None else dims.H
++
++    # Transpose [H0, H1_shard, block_T] -> [block_T, H_per_shard] in SBUF
++    out_transposed = nl.ndarray((block_T, H_per_shard), dtype=io_dtype, buffer=nl.sbuf)
++    out_transposed_reshaped = out_transposed.reshape((block_T, H0, H1_shard))
++    for h1_idx in range(H1_shard):
++        tp_psum = nl.ndarray((block_T, H0), dtype=io_dtype, buffer=nl.psum)
++        nisa.nc_transpose(dst=tp_psum[:block_T, :H0], data=output_sb[:H0, h1_idx, :block_T])
++        nisa.tensor_copy(
++            dst=out_transposed_reshaped[:block_T, :H0, h1_idx],
++            src=tp_psum[:block_T, :H0],
++        )
++
++    # Indirect scatter to HBM
++    for tile_t in range(dynamism_cfg.blk_n_T_tiles):
++        tile_T_actual = min(dynamism_cfg.blk_tile_T, block_T - tile_t * dynamism_cfg.blk_tile_T)
++        dst_ap = output_hbm.ap(
++            pattern=[[row_stride, dynamism_cfg.blk_tile_T], [1, H_per_shard]],
++            offset=h_offset,
++            vector_offset=token_indices_T_sb.ap(
++                pattern=[[dynamism_cfg.blk_n_T_tiles, dynamism_cfg.blk_tile_T], [1, 1]],
++                offset=tile_t,
++            ),
++            indirect_dim=0,
++        )
++        src_tile = out_transposed[nl.ds(tile_t * dynamism_cfg.blk_tile_T, tile_T_actual), :H_per_shard]
++        if is_first_expert:
++            nisa.dma_copy(
++                src=src_tile,
++                dst=dst_ap,
++                oob_mode=nisa.oob_mode.skip,
++                dge_mode=nisa.dge_mode.swdge,
++            )
++        else:
++            nisa.dma_compute(
++                dst=dst_ap,
++                srcs=[dst_ap, src_tile],
++                scales=[1.0, 1.0],
++                reduce_op=nl.add,
++                oob_mode=nisa.oob_mode.skip,
++            )
++
++
++def _sequential_store_block(
++    output_sb,
++    output_hbm,
++    token_indices_T_sb,
++    hidden_input,
++    write_offset,
++    dims,
++    dynamism_cfg,
++    io_dtype,
++    output_row_stride,
++):
++    """
++    Sequential store for PACK_OUTPUT_ROWS: write block output to consecutive rows at write_offset.
++
++    Also copies token indices from input to output at the packed position.
++
++    Args:
++        output_sb (nl.NkiTensor): [H0, H1_shard, block_T] expert MLP output in SBUF.
++        output_hbm (nl.NkiTensor): [T, H+2] output in HBM.
++        token_indices_T_sb (nl.NkiTensor): [blk_tile_T, blk_n_T_tiles] transposed token indices (original positions).
++        hidden_input (nl.NkiTensor): [T, H_concat] input in HBM (for token index extraction).
++        write_offset (nl.NkiTensor): [1, 1] SBUF tensor tracking current write position.
++        dims: MLPTKGConstantsDimensionSizes.
++        dynamism_cfg (AllExpertDynamismConfig): Dynamism parameters.
++        io_dtype: Data type.
++        output_row_stride (int): Row stride of output (H + 2).
++    """
++    block_T = dynamism_cfg.block_size
++    H0 = dims.H0
++    H1_shard = dims.H1_shard
++    H_per_shard = dims.H_per_shard
++    shard_id = dims.shard_id
++    h_offset = dims.H1_offset * H0
++    H = dims.H
++    E_L = dims.E
++    input_row_stride = hidden_input.shape[-1]
++
++    # Transpose [H0, H1_shard, block_T] -> [block_T, H_per_shard]
++    out_transposed = nl.ndarray((block_T, H_per_shard), dtype=io_dtype, buffer=nl.sbuf)
++    out_transposed_reshaped = out_transposed.reshape((block_T, H0, H1_shard))
++    for h1_idx in range(H1_shard):
++        tp_psum = nl.ndarray((block_T, H0), dtype=io_dtype, buffer=nl.psum)
++        nisa.nc_transpose(dst=tp_psum[:block_T, :H0], data=output_sb[:H0, h1_idx, :block_T])
++        nisa.tensor_copy(
++            dst=out_transposed_reshaped[:block_T, :H0, h1_idx],
++            src=tp_psum[:block_T, :H0],
++        )
++
++    # Sequential write to output at write_offset (indirect on row dimension)
++    for tile_t in range(dynamism_cfg.blk_n_T_tiles):
++        tile_T_actual = min(dynamism_cfg.blk_tile_T, block_T - tile_t * dynamism_cfg.blk_tile_T)
++        # Write hidden output
++        nisa.dma_copy(
++            src=out_transposed[nl.ds(tile_t * dynamism_cfg.blk_tile_T, tile_T_actual), :H_per_shard],
++            dst=output_hbm.ap(
++                pattern=[[output_row_stride, dynamism_cfg.blk_tile_T], [1, H_per_shard]],
++                offset=h_offset,
++                scalar_offset=write_offset,
++                indirect_dim=0,
++            ),
++            dge_mode=nisa.dge_mode.swdge,
++        )
++
++        # Copy token indices from input to output (only NC0 writes the 2 trailing columns)
++        if shard_id == 0:
++            token_idx_sb = nl.ndarray((dynamism_cfg.blk_tile_T, BF16_PER_INT32), dtype=io_dtype, buffer=nl.sbuf)
++            nisa.dma_copy(
++                src=hidden_input.ap(
++                    pattern=[[input_row_stride, dynamism_cfg.blk_tile_T], [1, BF16_PER_INT32]],
++                    offset=H + E_L,
++                    vector_offset=token_indices_T_sb.ap(
++                        pattern=[[dynamism_cfg.blk_n_T_tiles, dynamism_cfg.blk_tile_T], [1, 1]],
++                        offset=tile_t,
++                    ),
++                    indirect_dim=0,
++                ),
++                dst=token_idx_sb[:tile_T_actual, :BF16_PER_INT32],
++                oob_mode=nisa.oob_mode.skip,
++                dge_mode=nisa.dge_mode.swdge,
++            )
++            nisa.dma_copy(
++                src=token_idx_sb[:tile_T_actual, :BF16_PER_INT32],
++                dst=output_hbm.ap(
++                    pattern=[[output_row_stride, dynamism_cfg.blk_tile_T], [1, BF16_PER_INT32]],
++                    offset=H,
++                    scalar_offset=write_offset,
++                    indirect_dim=0,
++                ),
++                dge_mode=nisa.dge_mode.swdge,
++            )
++
++        # Increment write offset
++        nisa.tensor_scalar(data=write_offset, op0=nl.add, operand0=tile_T_actual, dst=write_offset)
++
++
++def _compute_dynamic_block(
++    params,
++    dims,
++    dynamism_cfg,
++    io_dtype,
++    routed_token_indices,
++    expert_affinities,
++    expert_idx,
++    block_idx,
++    output_hbm,
++    is_dynamic_block,
++    input_row_stride=None,
++    write_offset=None,
++    is_first_expert=True,
++    output_indices_hbm=None,
++    prealloc_gate_up_sb=None,
++    prealloc_gate_up_sb_casted=None,
++    prealloc_gate_up_buffers=None,
++):
++    """
++    Compute expert MLP for a single block of routed tokens.
++
++    Gathers input, computes gate_up -> down -> affinity scale, and scatters output.
++
++    Args:
++        params (MLPParameters): MLP parameters with expert weights already selected.
++        dims: MLPTKGConstantsDimensionSizes.
++        dynamism_cfg (AllExpertDynamismConfig): Dynamism parameters.
++        sbm (SbufManager): SBUF manager.
++        allocator: SBUF allocator callable.
++        io_dtype: I/O data type.
++        routed_token_indices: Static: [pmax, T+1] SBUF. Dynamic: [n_dynamic_blocks, block_size] HBM.
++        expert_affinities (nl.NkiTensor): [T, E] expert affinities.
++        expert_idx: Current expert index.
++        block_idx: Block index (int literal for static, [1,1] SBUF tensor for dynamic).
++        output_hbm (nl.NkiTensor): [T, H] output in HBM.
++        is_dynamic_block (bool): Whether this is a dynamic block.
++        is_first_expert (bool): Whether this is the first expert (overwrite vs accumulate output).
++    """
++    block_T = dynamism_cfg.block_size
++    pmax = dims._pmax
++
++    block_sbm = SbufManager(0, 200000, get_logger("dynamic_block"), use_auto_alloc=True)
++    block_sbm.open_scope()
++    if is_dynamic_block:
++        block_sbm.set_name_prefix(f"e{expert_idx}_dyn_blk_")
++    else:
++        block_sbm.set_name_prefix(f"e{expert_idx}_static_blk{block_idx}_")
++
++    token_indices_T_sb = _get_block_token_indices(
++        dynamism_cfg,
++        routed_token_indices,
++        block_idx,
++        is_dynamic_block,
++    )
++    input_sb = _gather_input_block(
++        params.hidden_tensor,
++        token_indices_T_sb,
++        dims,
++        dynamism_cfg,
++        io_dtype,
++        None,
++        input_row_stride=input_row_stride,
++    )
++
++    orig_T = dims.T
++    dims.T = block_T
++
++    # Gate Up projection
++    if prealloc_gate_up_sb is not None:
++        gate_up_sb = prealloc_gate_up_sb
++        nisa.memset(gate_up_sb, 0)
++    else:
++        gate_up_sb = nl.ndarray(
++            (dims.I0, div_ceil(dims.I, dims.I0), block_T),
++            dtype=nl.float32,
++            buffer=nl.sbuf,
++        )
++    gate_tile_info = process_gate_up_projection(
++        hidden=input_sb,
++        output=gate_up_sb,
++        params=params,
++        dims=dims,
++        sbm=block_sbm,
++        T_offset=0,
++        share_memory_scope=True,
++        use_dge=is_dynamic_block,
++        prealloc_gate_up_buffers=prealloc_gate_up_buffers if is_dynamic_block else None,
++    )
++
++    # Load and broadcast expert affinity for this block
++    if params.expert_params.expert_affinities_scaling_mode == ExpertAffinityScaleMode.POST_SCALE:
++        block_aff_sb = nl.ndarray(
++            (dynamism_cfg.blk_tile_T, dynamism_cfg.blk_n_T_tiles, 1), dtype=expert_affinities.dtype, buffer=nl.sbuf
++        )
++        # Zero-init ensures padded positions (oob_mode.skip) have zero affinity,
++        # so their MLP output is zeroed out before scatter (safe even if dma_compute doesn't skip).
++        nisa.memset(block_aff_sb, 0)
++        for tile_t in range(dynamism_cfg.blk_n_T_tiles):
++            nisa.dma_copy(
++                src=expert_affinities.ap(
++                    pattern=[[dims.E, dynamism_cfg.blk_tile_T], [1, 1], [1, 1]],
++                    offset=expert_idx,
++                    vector_offset=token_indices_T_sb.ap(
++                        pattern=[[dynamism_cfg.blk_n_T_tiles, dynamism_cfg.blk_tile_T], [1, 1]],
++                        offset=tile_t,
++                    ),
++                    indirect_dim=0,
++                ),
++                dst=block_aff_sb[:, tile_t, 0],
++                oob_mode=nisa.oob_mode.skip,
++            )
++        block_aff_flat = block_aff_sb.reshape((block_T, 1))
++        identity_sb = nl.shared_identity_matrix(block_T, dtype=io_dtype)
++        block_aff_cast = nl.ndarray((block_T, 1), dtype=io_dtype, buffer=nl.sbuf)
++        nisa.activation(dst=block_aff_cast[:block_T, :], op=nl.copy, data=block_aff_flat[:block_T, :])
++        aff_psum = nl.ndarray((1, block_T), dtype=nl.float32, buffer=nl.psum)
++        nisa.nc_matmul(dst=aff_psum[:, :], stationary=block_aff_cast, moving=identity_sb[:block_T, :block_T])
++        expert_affinities_broadcast = nl.ndarray((pmax, block_T), dtype=io_dtype, buffer=nl.sbuf)
++        nisa.tensor_copy(src=aff_psum[:, :], dst=expert_affinities_broadcast[:1, :block_T])
++        for pg in range(4):
++            nisa.nc_stream_shuffle(
++                dst=expert_affinities_broadcast[nl.ds(32 * pg, 32), :block_T],
++                src=expert_affinities_broadcast[:1, :block_T],
++                shuffle_mask=[0] * 32,
++            )
++
++    # Down projection
++    down_sb = nl.ndarray(
++        (dims.H0, dims.H1_shard, block_T),
++        dtype=io_dtype,
++        buffer=nl.sbuf,
++    )
++    if prealloc_gate_up_sb_casted is not None:
++        gate_up_sb_casted = prealloc_gate_up_sb_casted
++    else:
++        gate_up_sb_casted = nl.ndarray(
++            (dims.I0, div_ceil(dims.I, dims.I0), block_T),
++            dtype=io_dtype,
++            buffer=nl.sbuf,
++        )
++    nisa.tensor_copy(dst=gate_up_sb_casted, src=gate_up_sb)
++    process_down_projection(
++        hidden=gate_up_sb_casted,
++        output=down_sb,
++        params=params,
++        dims=dims,
++        gate_tile_info=gate_tile_info,
++        sbm=block_sbm,
++        use_dge=is_dynamic_block,
++    )
++
++    # Apply affinity scaling
++    if params.expert_params.expert_affinities_scaling_mode == ExpertAffinityScaleMode.POST_SCALE:
++        for shard in range(dims.H1_shard):
++            nisa.tensor_tensor(
++                data1=down_sb[: dims.H0, shard, :block_T],
++                data2=expert_affinities_broadcast,
++                op=nl.multiply,
++                dst=down_sb[: dims.H0, shard, :block_T],
++            )
++
++    dims.T = orig_T
++
++    # Scatter output to HBM
++    # PACK_OUTPUT_ROWS sequential store only valid for E=1 (single local expert after EP).
++    # For E>1, scatter to original positions with accumulation (same as PRESERVE_ROW_ORDER).
++    use_sequential_store = (
++        dynamism_cfg.all_to_all_v_strategy == MoEAllToAllVStrategy.PACK_OUTPUT_ROWS
++        and is_first_expert
++        and write_offset is not None
++    )
++    if use_sequential_store:
++        # E=1 or first expert: sequential store packs output + token indices
++        output_row_stride = dims.H + BF16_PER_INT32
++        _sequential_store_block(
++            output_sb=down_sb,
++            output_hbm=output_hbm,
++            token_indices_T_sb=token_indices_T_sb,
++            hidden_input=params.hidden_tensor,
++            write_offset=write_offset,
++            dims=dims,
++            dynamism_cfg=dynamism_cfg,
++            io_dtype=io_dtype,
++            output_row_stride=output_row_stride,
++        )
++    else:
++        output_row_stride = (
++            (dims.H + BF16_PER_INT32) if dynamism_cfg.all_to_all_v_strategy != MoEAllToAllVStrategy.DISABLED else None
++        )
++        # For PACK_OUTPUT_ROWS E>1: remap token indices to packed output positions
++        scatter_indices = token_indices_T_sb
++        if output_indices_hbm is not None:
++            scatter_indices = nl.ndarray(
++                (dynamism_cfg.blk_tile_T, dynamism_cfg.blk_n_T_tiles), dtype=nl.int32, buffer=nl.sbuf
++            )
++            nisa.memset(scatter_indices, NONZERO_WITH_COUNT_PAD_VAL)
++            for tile_t in range(dynamism_cfg.blk_n_T_tiles):
++                nisa.dma_copy(
++                    src=output_indices_hbm.ap(
++                        pattern=[[1, dynamism_cfg.blk_tile_T], [1, 1]],
++                        offset=0,
++                        vector_offset=token_indices_T_sb.ap(
++                            pattern=[[dynamism_cfg.blk_n_T_tiles, dynamism_cfg.blk_tile_T], [1, 1]],
++                            offset=tile_t,
++                        ),
++                        indirect_dim=0,
++                    ),
++                    dst=scatter_indices[:, tile_t : tile_t + 1],
++                    oob_mode=nisa.oob_mode.skip,
++                    dge_mode=nisa.dge_mode.swdge,
++                )
++        _scatter_output_block(
++            down_sb,
++            output_hbm,
++            scatter_indices,
++            dims,
++            dynamism_cfg,
++            io_dtype,
++            output_row_stride=output_row_stride,
++            is_first_expert=is_first_expert,
++        )
++
++
++def _compute_expert_mlp_tkg(
++    input_sb,
++    params,
++    dims,
++    sbm,
++    allocator,
++    expert_affinities_sb,
++    aff_num_tiles,
++    identity_sb,
++    use_auto_alloc,
++    io_dtype,
++    output_temp,
++    expertIdx,
++    t_offset,
++    t_idx,
++    t_cfg,
++    current_tile_T,
++    hidden_in_sbuf,
++):
++    """
++    Core expert MLP computation for one (expert, T-tile) pair.
++
++    Computes gate/up projection, down projection, affinity scaling, and accumulation
++    into the output buffer. This is the reusable computation unit shared by both
++    static and (future) dynamic paths.
++
++    Args:
++        input_sb: Input hidden states for this T-tile (nl.NkiTensor in SBUF).
++        params (MLPParameters): MLP parameters with expert weights already selected.
++        dims: MLPTKGConstantsDimensionSizes with T set to current_tile_T.
++        sbm (SbufManager): SBUF memory manager.
++        allocator: SBUF allocator callable.
++        expert_affinities_sb: Expert affinities in SBUF.
++        aff_num_tiles: Number of affinity tiles.
++        identity_sb: Pre-loaded identity matrix (or None).
++        use_auto_alloc: Whether auto allocation is enabled.
++        io_dtype: I/O data type.
++        output_temp: Accumulation buffer [H0, H1_shard, tile_T * num_tiles] in SBUF.
++        expertIdx: Current expert index.
++        t_offset: Token offset for this T-tile.
++        t_idx: T-tile index.
++        t_cfg (TokenTilingConfig): Token tiling configuration.
++        current_tile_T: Number of tokens in this tile.
++        hidden_in_sbuf: Whether hidden input is in SBUF.
++    """
++    # Get expert affinity for this T-tile
++    expertAffinityLoc = get_all_expert_tile_affinities(
++        expert_affinities_sb, aff_num_tiles, t_offset, current_tile_T, dims, allocator
++    )
++
++    # Allocate buffers for this tile
++    gate_up_sb = allocator(
++        (dims.I0, div_ceil(dims.I, dims.I0), current_tile_T),
++        dtype=nl.float32,
++        name="gate_up_sbuf",
++        buffer=nl.sbuf,
++    )
++    down_sb = allocator((dims.H0, dims.H1_shard, current_tile_T), dtype=io_dtype, name="down_sbuf", buffer=nl.sbuf)
++
++    # Gate Up projection
++    gate_tile_info = process_gate_up_projection(
++        hidden=input_sb,
++        output=gate_up_sb,
++        params=params,
++        dims=dims,
++        sbm=sbm,
++        T_offset=t_offset if hidden_in_sbuf else 0,
++        share_memory_scope=not params.use_tkg_gate_up_proj_column_tiling,
++    )
++
++    # Compute POST_SCALE affinity broadcast
++    if params.expert_params.expert_affinities_scaling_mode == ExpertAffinityScaleMode.POST_SCALE:
++        expert_affinities_broadcast = broadcast_all_expert_affinity(
++            expert_affinities_sb,
++            aff_num_tiles,
++            expertIdx,
++            t_offset,
++            current_tile_T,
++            io_dtype,
++            identity_sb,
++            dims,
++            allocator,
++            use_auto_alloc,
++        )
++
++    # Down projection
++    gate_up_sb_casted = allocator(
++        (dims.I0, div_ceil(dims.I, dims.I0), current_tile_T),
++        dtype=io_dtype,
++        name="gate_up_sbuf_with_io_dtype",
++        buffer=nl.sbuf,
++    )
++    nisa.tensor_copy(dst=gate_up_sb_casted, src=gate_up_sb)
++    process_down_projection(
++        hidden=gate_up_sb_casted,
++        output=down_sb,
++        params=params,
++        dims=dims,
++        gate_tile_info=gate_tile_info,
++        sbm=sbm,
++    )
++
++    # Apply affinity scaling to down_sb [H0, H1_shard, current_tile_T]
++    if params.expert_params.expert_affinities_scaling_mode == ExpertAffinityScaleMode.POST_SCALE:
++        for shard in range(dims.H1_shard):
++            nisa.tensor_tensor(
++                data1=down_sb[: dims.H0, shard, :current_tile_T],
++                data2=expert_affinities_broadcast,
++                op=nl.multiply,
++                dst=down_sb[: dims.H0, shard, :current_tile_T],
++            )
++
++    # Accumulate down_sb [H0, H1_shard, tile_T] into output_temp
++    t_free_offset = t_idx * t_cfg.tile_T
++    if expertIdx == 0:
++        nisa.tensor_copy(
++            dst=output_temp[: dims.H0, : dims.H1_shard, nl.ds(t_free_offset, current_tile_T)],
++            src=down_sb[: dims.H0, : dims.H1_shard, :current_tile_T],
++        )
++    else:
++        nisa.tensor_tensor(
++            data1=down_sb[: dims.H0, : dims.H1_shard, :current_tile_T],
++            data2=output_temp[: dims.H0, : dims.H1_shard, nl.ds(t_free_offset, current_tile_T)],
++            op=nl.add,
++            dst=output_temp[: dims.H0, : dims.H1_shard, nl.ds(t_free_offset, current_tile_T)],
++        )
++
++
++def _select_quant_scales(
++    quant_params: MLPQuantizationParameters,
++    gate_w_scale: nl.NkiTensor,
++    up_w_scale: nl.NkiTensor,
++    down_w_scale: nl.NkiTensor,
++    gate_up_in_scale: nl.NkiTensor,
++    down_in_scale: nl.NkiTensor,
++    expertIdx: int,
++):
++    """
++    Select and reshape quantization scales for a specific expert.
++
++    Args:
++        quant_params (MLPQuantizationParameters): Quantization parameters.
++        gate_w_scale (nl.NkiTensor): Gate weight scale tensor.
++        up_w_scale (nl.NkiTensor): Up weight scale tensor.
++        down_w_scale (nl.NkiTensor): Down weight scale tensor.
++        gate_up_in_scale (nl.NkiTensor): Gate/up input scale tensor.
++        down_in_scale (nl.NkiTensor): Down input scale tensor.
++        expertIdx (int): Expert index to select scales for.
++
++    Returns:
++        MLPQuantizationParameters: Quantization parameters with scales for the specified expert.
++    """
++    quantization_type = quant_params.quantization_type
++    expert_gate_w_scale = None
++    if gate_w_scale != None:
++        expert_gate_w_scale = gate_w_scale.select(dim=0, index=expertIdx).select(dim=0, index=GateUpDim.GATE.value)
++        expert_gate_w_scale = reshape_scale_for_mlp(expert_gate_w_scale)
++
++    expert_up_w_scale = None
++    if up_w_scale != None:
++        expert_up_w_scale = up_w_scale.select(dim=0, index=expertIdx).select(dim=0, index=GateUpDim.UP.value)
++        expert_up_w_scale = reshape_scale_for_mlp(expert_up_w_scale)
++
++    expert_down_w_scale = None
++    if down_w_scale != None:
++        expert_down_w_scale = down_w_scale.select(dim=0, index=expertIdx)
++        expert_down_w_scale = reshape_scale_for_mlp(expert_down_w_scale)
++
++    expert_gate_up_in_scale = None
++    if gate_up_in_scale != None:
++        expert_gate_up_in_scale = reshape_scale_for_mlp(gate_up_in_scale.select(dim=0, index=expertIdx))
++
++    expert_down_in_scale = None
++    if down_in_scale != None:
++        expert_down_in_scale = reshape_scale_for_mlp(down_in_scale.select(dim=0, index=expertIdx))
++
++    return MLPQuantizationParameters(
++        quantization_type=quantization_type,
++        gate_w_scale=expert_gate_w_scale,
++        up_w_scale=expert_up_w_scale,
++        down_w_scale=expert_down_w_scale,
++        gate_up_in_scale=expert_gate_up_in_scale,
++        down_in_scale=expert_down_in_scale,
++        clipping_bound=quant_params.clipping_bound if quant_params != None else None,
++    )
+diff --git a/vllm_neuron/model/mimo_v2/nki_moe_tkg/mlp_tkg_down_projection.py b/vllm_neuron/model/mimo_v2/nki_moe_tkg/mlp_tkg_down_projection.py
+new file mode 100644
+index 0000000..274b5de
+--- /dev/null
++++ b/vllm_neuron/model/mimo_v2/nki_moe_tkg/mlp_tkg_down_projection.py
+@@ -0,0 +1,317 @@
++# Vendored for MiMo-V2 (T48) from nkilib core/moe/moe_tkg/mlp_tkg_down_projection.py of nki 0.7.0+37713544100.gfede04bb
++# (Neuron SDK 2.33.0 DLAMI). Only change besides the imports: see nki_moe_tkg/__init__.py.
++# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License").
++# You may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Down projection sub-kernels for MLP TKG with column tiling and LHS/RHS swap modes."""
++
++import nki.isa as nisa
++import nki.language as nl
++
++from nkilib.core.utils.allocator import SbufManager
++from nkilib.core.utils.interleave_copy import interleave_copy
++from nkilib.core.utils.kernel_helpers import div_ceil, resolve_fp8_e4m3_dtype
++from nkilib.core.utils.tiled_range import TiledRange
++from nkilib.core.moe.moe_tkg.mlp_parameters import MLPParameters, mlpp_has_down_projection_bias
++from nkilib.core.moe.moe_tkg.mlp_tkg_constants import (
++    MLPTKGConstants,
++    MLPTKGConstantsDimensionSizes,
++    MLPTKGConstantsDownTileCounts,
++    MLPTKGConstantsGateUpTileCounts,
++)
++from .mlp_tkg_down_projection_lhs_rhs_swap import down_projection_lhs_rhs_swap
++from nkilib.core.moe.moe_tkg.projection_utils import adaptive_dge_mode, prepare_down_bias_and_scale
++
++_DGE_MODE_UNKNOWN = 0  # Compiler decides best DMA mode internally
++_DGE_MODE_NONE = 3  # Use STATIC DMA mode
++
++
++def down_projection(
++    hidden: nl.NkiTensor,
++    weight: nl.NkiTensor,
++    output_tile: nl.NkiTensor,
++    weight_tiles: list[nl.NkiTensor],
++    bias_tile: nl.NkiTensor,
++    dequant_tile: nl.NkiTensor,
++    dims: MLPTKGConstantsDimensionSizes,
++    tiles: MLPTKGConstantsDownTileCounts,
++    params: MLPParameters,
++    sbm: SbufManager,
++):
++    """
++    Performs a single Down projection shard on the H.
++
++    All weight/bias inputs are pre-sharded NkiTensor instances — callers handle LNC/shard slicing.
++
++    Computes: Hidden[I, T] @ Weight[I, H_per_shard] + Optional(bias_tile) → [T, H_per_shard]
++    - Hidden is the stationary tensor, Weight is the moving tensor.
++
++    Tiled computation:
++    H/512 * [ I/128 * (Hidden[128, T] @ Weight[128, 512]) ]
++
++    Tile Load:
++    Weight tiles are loaded [HTile, I] at a time for efficient memory access:
++    H/HTile * [ HTile/512 * [ I/128 * (Hidden[128, T] @ Weight[128, 512]) ] ]
++
++    Column Tiling Optimization:
++    For small T, column tiling improves performance by fully utilizing PE engine space.
++    E.g., if T=32, the hidden tile [128, 32] leaves unused 32:128 column space in PE engine.
++
++    After Column Tiling:
++    ---------------------------
++    | col_tile_1 | col_tile_2 | col_tile_3 | col_tile_4 |
++    | 32 columns | 32 columns | 32 columns | 32 columns |
++    ---------------------------
++    - `column_tiling_dim` = [32, 64, 128], chosen based on T.
++    - `column_tiling_factor` = 128 / column_tiling_dim, with a maximum factor of 4 → up to 4× speedup.
++    - `column_tile` = HTile / column_tiling_factor
++    H/HTile * HTile/column_tiling_factor(parallel execution) * column_tile/512 * [ I/128 * (Hidden[128, T] @ Weight[128, 512]) ]
++
++    Key Points:
++    -----------
++    - Matrix multiplication is tiled along H and I
++    - Column tiling improves PE utilization for small T
++
++    Args:
++        hidden (nl.NkiTensor): [I0, I1, T] — hidden activations in SBUF
++        weight (NkiTensor): [I, H_per_shard] — pre-sharded weight matrix
++        output_tile (nl.NkiTensor): [T, H_per_shard] — output buffer in SBUF
++
++    Returns:
++        Output tensor with shape [T, H_per_shard]
++    """
++
++    # ---------- Configuration and Dimension Setup ----------
++    I0, I1, T = hidden.shape
++    I = weight.shape[0]
++    H = dims.H_per_shard
++    num_Itiles = div_ceil(I, I0)
++
++    weight_base_idx = tiles.weight_base_idx
++
++    # ---------- Compute matmul  ----------
++    num_required_psums_per_HTile = div_ceil(tiles.HTile, dims._psum_fmax)
++    num_required_psum_after_column_tiling = div_ceil(num_required_psums_per_HTile, dims.column_tiling_factor)
++
++    # Total PSUM banks divided by PSUMs needed per HTile
++    num_available_psum_group = dims._psum_bmax // num_required_psum_after_column_tiling
++
++    for hidden_tiles in TiledRange(H, tiles.HTile):
++        h_offset = hidden_tiles.start_offset
++
++        # Allocate PSUM
++        psum_offset = (hidden_tiles.index % num_available_psum_group) * num_required_psum_after_column_tiling
++        result_psums = []
++        for psum_idx in range(num_required_psum_after_column_tiling):
++            result_psum = nl.ndarray(
++                shape=(dims._pmax, dims._psum_fmax),
++                dtype=nl.float32,
++                name=f"down_psum_{sbm.get_name_prefix()}_{hidden_tiles.index}_{psum_offset + psum_idx}",
++                buffer=nl.psum,
++                address=None if sbm.is_auto_alloc() else (0, (psum_offset + psum_idx) * dims._psum_fmax * 4),
++            )
++            result_psums.append(result_psum)
++
++        for i_tile in TiledRange(I, I0):
++            weight_idx = (weight_base_idx + hidden_tiles.index * num_Itiles + i_tile.index) % tiles.num_allocated_w_tile
++
++            hidden_sb_tile_slice = hidden.slice(dim=0, start=0, end=i_tile.size).slice(
++                dim=1, start=i_tile.index, end=i_tile.index + 1
++            )
++            weight_sb_tile_slice = (
++                weight_tiles[weight_idx]
++                .slice(dim=0, start=0, end=i_tile.size)
++                .slice(dim=1, start=0, end=hidden_tiles.size)
++            )
++
++            # Load weight [I0, HTile] from HBM into SBUF tile
++            weight_view = weight.slice(dim=0, start=i_tile.start_offset, end=i_tile.end_offset).slice(
++                dim=1, start=h_offset, end=h_offset + hidden_tiles.size
++            )
++            nisa.dma_copy(
++                dst=weight_sb_tile_slice,
++                src=weight_view,
++                dge_mode=_DGE_MODE_NONE,
++            )
++
++            # Matmul with column tiling: distribute tiles across columns and PSUM banks
++            for compute_tile in TiledRange(hidden_tiles.size, dims._psum_fmax):
++                column_tile_index = compute_tile.index % dims.column_tiling_factor
++                psum_bank_index = compute_tile.index // dims.column_tiling_factor
++                nisa.nc_matmul(
++                    dst=result_psums[psum_bank_index][
++                        nl.ds(dims.column_tiling_dim * column_tile_index, T),
++                        0 : compute_tile.size,
++                    ],
++                    stationary=hidden_sb_tile_slice,
++                    moving=weight_sb_tile_slice.slice(
++                        dim=1, start=compute_tile.start_offset, end=compute_tile.end_offset
++                    ),
++                    tile_position=(0, dims.column_tiling_dim * column_tile_index),
++                    tile_size=(I0, dims.column_tiling_dim),
++                )
++
++        # ---------- Copy PSUM output to SBUF, optionally applying dequant scale ----------
++        for compute_tile in TiledRange(hidden_tiles.size, dims._psum_fmax):
++            column_tile_index = compute_tile.index % dims.column_tiling_factor
++            psum_bank_index = compute_tile.index // dims.column_tiling_factor
++            dst_offset = h_offset + compute_tile.index * dims._psum_fmax
++            interleave_copy(
++                index=column_tile_index,
++                dst=output_tile.slice(dim=1, start=dst_offset, end=dst_offset + compute_tile.size),
++                src=result_psums[psum_bank_index][
++                    nl.ds(dims.column_tiling_dim * column_tile_index, T),
++                    0 : compute_tile.size,
++                ],
++                scale=dequant_tile.slice(dim=1, start=dst_offset, end=dst_offset + compute_tile.size)
++                if params.quant_params.is_quant_row()
++                else dequant_tile,
++                bias=None,
++            )
++
++    # ---------- Apply bias ----------
++    is_bias = bias_tile is not None
++    if is_bias:
++        nisa.tensor_tensor(
++            dst=output_tile,
++            data1=output_tile,
++            data2=bias_tile,
++            op=nl.add,
++        )
++
++
++def process_down_projection(
++    hidden: nl.NkiTensor,
++    output: nl.NkiTensor,
++    params: MLPParameters,
++    dims: MLPTKGConstantsDimensionSizes,
++    gate_tile_info: MLPTKGConstantsGateUpTileCounts,
++    sbm: SbufManager,
++    use_dge: bool = False,
++):
++    """
++    Performs the Down projection for MLP (T = BxS).
++    Expected hidden tensor shape is [128(I0), I/128, T],
++    with a remainder tile shape of [res_I, I/128, T] if I is not a multiple of 128.
++
++    Overview:
++    ---------
++    hidden @ down_weight + optional(down_bias)
++    # [T, H] = [T, I] @ [I, H] + optional([1, H])
++
++    Hardware constraints (max partition size of 128) require tiling along the I dimension:
++    # hidden [128, I//128, T] @ down_weight [128, I//128, H]
++
++    Behavior based on `use_tkg_down_proj_column_tiling`:
++    ---------------------------------------
++    - False: column tiling(`down_projection`)
++        hidden[128, T] @ down_weight[128, H] → [T, H]
++        Output shape: [T, H]
++
++    - True: operands swapped(`down_projection_lhs_rhs_swap`)
++        down_weight[128, H] @ hidden[128, T] → [H, T]
++        Further tiling along H: [128, H//128, T]
++        Output shape: [128, H//128, T]
++
++    DMA mode:
++    ---------
++    Based on experiments, Static DMA provides better performance.
++    The MLP TKG implementation therefore uses Static DMA for tensor loads.
++    If HBM out-of-memory (OOM) issues arise, we can fall back to DGE mode.
++
++    Note:
++    ---------
++    Caller will have the flexibility to manage sbm:sbufManager's scope and interleave degree.
++
++    """
++    down_w = params.down_proj_weights_tensor
++    down_b, down_w_scale = prepare_down_bias_and_scale(params, dims)
++    down_w_view = down_w.slice(dim=1, start=dims.H1_offset * dims.H0, end=dims.H1_offset * dims.H0 + dims.H_per_shard)
++
++    # ---------------- Allocate and Load Bias Tile ----------------
++    bias_tile = None
++    if mlpp_has_down_projection_bias(params):
++        bias_tile = sbm.alloc_stack(
++            down_b.shape,
++            dtype=down_b.dtype,
++            name=f"down_bias",
++            buffer=nl.sbuf,
++        )
++        nisa.dma_copy(
++            dst=bias_tile,
++            src=down_b,
++            dge_mode=nisa.dge_mode.hwdge if use_dge else adaptive_dge_mode(down_b),
++        )
++
++    dequant_tile = None
++    # ---------------- Quantization Scale ----------------
++    if params.quant_params.is_quant():
++        dequant_tile = sbm.alloc_stack(
++            down_w_scale.shape,
++            dtype=down_w_scale.dtype,
++            name=f"down_w_scale_sb",
++            align=4,
++        )
++        nisa.dma_copy(
++            dst=dequant_tile,
++            src=down_w_scale,
++            dge_mode=nisa.dge_mode.hwdge if use_dge else adaptive_dge_mode(down_w_scale),
++        )
++
++    # ---------------- Allocate Weight Tiles ----------------
++    tiles = MLPTKGConstants.calculate_down_tiles(params, dims, gate_tile_info, sbm)
++
++    _fp8_e4m3_tile_dtype = resolve_fp8_e4m3_dtype(params.dtype_mode)
++
++    weight_tiles = []
++    for w_tile_idx in range(tiles.num_allocated_w_tile):
++        weight_tile = sbm.alloc_stack(
++            (dims.I0, tiles.HTile),
++            name=f"down_w_tile_{w_tile_idx}",
++            dtype=_fp8_e4m3_tile_dtype if str(down_w.dtype) == "float8e4" else down_w.dtype,
++            buffer=nl.sbuf,
++        )
++        weight_tiles.append(weight_tile)
++
++    # ---------------- Down Projection ----------------
++    if params.use_tkg_down_proj_column_tiling:
++        down_projection(
++            hidden=hidden,
++            weight=down_w_view,
++            output_tile=output,
++            weight_tiles=weight_tiles,
++            bias_tile=bias_tile,
++            dequant_tile=dequant_tile,
++            dims=dims,
++            tiles=tiles,
++            params=params,
++            sbm=sbm,
++        )
++
++    else:
++        down_projection_lhs_rhs_swap(
++            hidden=hidden,
++            weight=down_w_view,
++            output_tile=output,
++            weight_tiles=weight_tiles,
++            bias_tile=bias_tile,
++            dequant_tile=dequant_tile,
++            dims=dims,
++            tiles=tiles,
++            params=params,
++            sbm=sbm,
++            use_dge=use_dge,
++        )
++
++    return output, tiles
+diff --git a/vllm_neuron/model/mimo_v2/nki_moe_tkg/mlp_tkg_down_projection_lhs_rhs_swap.py b/vllm_neuron/model/mimo_v2/nki_moe_tkg/mlp_tkg_down_projection_lhs_rhs_swap.py
+new file mode 100644
+index 0000000..9ff0341
+--- /dev/null
++++ b/vllm_neuron/model/mimo_v2/nki_moe_tkg/mlp_tkg_down_projection_lhs_rhs_swap.py
+@@ -0,0 +1,195 @@
++# Vendored for MiMo-V2 (T48) from nkilib core/moe/moe_tkg/mlp_tkg_down_projection_lhs_rhs_swap.py of nki 0.7.0+37713544100.gfede04bb
++# (Neuron SDK 2.33.0 DLAMI). Only change besides the imports: see nki_moe_tkg/__init__.py.
++# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License").
++# You may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Down projection sub-kernel for MLP TKG with LHS/RHS swap mode."""
++
++import nki.isa as nisa
++import nki.language as nl
++
++from nkilib.core.utils.allocator import SbufManager
++from nkilib.core.utils.interleave_copy import interleave_copy
++from nkilib.core.utils.kernel_assert import kernel_assert
++from nkilib.core.utils.kernel_helpers import div_ceil
++from nkilib.core.utils.tiled_range import TiledRange
++from nkilib.core.moe.moe_tkg.mlp_parameters import MLPParameters
++from nkilib.core.moe.moe_tkg.mlp_tkg_constants import (
++    MLPTKGConstantsDimensionSizes,
++    MLPTKGConstantsDownTileCounts,
++)
++from nkilib.core.moe.moe_tkg.projection_utils import adaptive_dge_mode
++
++
++def down_projection_lhs_rhs_swap(
++    hidden: nl.NkiTensor,
++    weight: nl.NkiTensor,
++    output_tile: nl.NkiTensor,
++    weight_tiles: list[nl.NkiTensor],
++    bias_tile: nl.NkiTensor,
++    dequant_tile: nl.NkiTensor,
++    dims: MLPTKGConstantsDimensionSizes,
++    tiles: MLPTKGConstantsDownTileCounts,
++    params: MLPParameters,
++    sbm: SbufManager,
++    use_dge: bool = False,
++):
++    """
++    Performs a single Down projection shard on the H using regular matmult with operands swapped.
++
++    All weight/bias inputs are pre-sharded NkiTensor instances — callers handle LNC/shard slicing.
++
++    Computes: Weight[I, H_per_shard] @ Hidden[I, T] + Optional(bias_tile) → [T, H_per_shard]
++    - Hidden is the moving tensor, Weight is the stationary tensor.
++
++    Tiled computation:
++        H/128 * [ I/128 * (Weight[128, 128] @ Hidden[128, T]) ]
++
++    Args:
++        hidden (nl.NkiTensor): [I0, I1, T] — hidden activations in SBUF
++        weight (NkiTensor): [I, H_per_shard] — pre-sharded weight matrix
++        output_tile (nl.NkiTensor): [H0, H1_shard, T] — output buffer in SBUF
++
++    Returns:
++        Output tensor with shape [128, H//128, T]
++    """
++
++    # ---------- Configuration and Dimension Setup ----------
++    I0, I1, T = hidden.shape
++    I = weight.shape[0]
++    H = dims.H_per_shard
++    H0 = dims.H0
++    num_Itiles = div_ceil(I, I0)
++
++    weight_base_idx = tiles.weight_base_idx
++
++    # ---------- Compute matmul ----------
++    perBankT = dims._psum_fmax // T
++    num_required_down_psum_banks = div_ceil(dims.H1_shard, perBankT)
++    kernel_assert(
++        num_required_down_psum_banks <= dims._psum_bmax,
++        f"Required psum banks for down projection: {num_required_down_psum_banks}, which exceeds hardware limit of {dims._psum_bmax}, please use CTE mode",
++    )
++
++    # Allocate PSUM buffers
++    result_psums = []
++    for psum_idx in range(num_required_down_psum_banks):
++        result_psum = nl.ndarray(
++            (dims._pmax, dims._psum_fmax),
++            dtype=nl.float32,
++            name=f"down_psum_{sbm.get_name_prefix()}_{psum_idx}",
++            buffer=nl.psum,
++            address=None if sbm.is_auto_alloc() else (0, psum_idx * dims._psum_fmax * 4),
++        )
++        result_psums.append(result_psum)
++
++    for hidden_tiles in TiledRange(H, tiles.HTile):
++        h1_offset = hidden_tiles.start_offset // H0
++
++        weight_hbm_tile_slice = weight.slice(dim=1, start=hidden_tiles.start_offset, end=hidden_tiles.end_offset)
++
++        for i_tile in TiledRange(I, I0):
++            # Load weight [I0, HTile] from HBM into SBUF tile
++            weight_idx = (weight_base_idx + hidden_tiles.index * num_Itiles + i_tile.index) % tiles.num_allocated_w_tile
++
++            hidden_sb_tile_slice = hidden.slice(dim=0, start=0, end=i_tile.size).slice(
++                dim=1, start=i_tile.index, end=i_tile.index + 1
++            )
++            weight_sb_tile_slice = (
++                weight_tiles[weight_idx]
++                .slice(dim=0, start=0, end=i_tile.size)
++                .slice(dim=1, start=0, end=hidden_tiles.size)
++            )
++
++            nisa.dma_copy(
++                dst=weight_sb_tile_slice,
++                src=weight_hbm_tile_slice.slice(dim=0, start=i_tile.start_offset, end=i_tile.end_offset),
++                dge_mode=nisa.dge_mode.hwdge if use_dge else adaptive_dge_mode(weight),
++            )
++
++            """
++            When use_tkg_down_proj_optimized_layout is disabled, the weight-tile access pattern
++            uses a stride of H1_shard. When enabled, the framework permutes the weights so
++            that the weight tile can be accessed without any stride.
++            """
++            if params.use_tkg_down_proj_optimized_layout:
++                for h1_tile in TiledRange(hidden_tiles.size, H0):
++                    psum_idx = (h1_offset + h1_tile.index) // perBankT
++                    psum_offset = (h1_offset + h1_tile.index) % perBankT
++                    nisa.nc_matmul(
++                        dst=result_psums[psum_idx][0:H0, nl.ds(psum_offset * T, T)],
++                        stationary=weight_sb_tile_slice.slice(
++                            dim=1, start=h1_tile.start_offset, end=h1_tile.end_offset
++                        ),
++                        moving=hidden_sb_tile_slice,
++                    )
++            else:
++                num_Htiles = div_ceil(hidden_tiles.size, H0)
++                weight_reshaped = weight_sb_tile_slice.reshape_dim(dim=1, shape=(H0, num_Htiles)).permute(
++                    dims=(0, 2, 1)
++                )
++                for h1_tile in TiledRange(hidden_tiles.size, H0):
++                    psum_idx = (h1_offset + h1_tile.index) // perBankT
++                    psum_offset = (h1_offset + h1_tile.index) % perBankT
++                    nisa.nc_matmul(
++                        dst=result_psums[psum_idx][0:H0, nl.ds(psum_offset * T, T)],
++                        stationary=weight_reshaped.select(dim=1, index=h1_tile.index),
++                        moving=hidden_sb_tile_slice,
++                    )
++
++    # Reshape output to 2D for PSUM copy (skip flatten if already 2D)
++    if output_tile.ndim > 2:
++        output_tile_nd = output_tile.flatten_dims(start_dim=1, end_dim=2)
++    else:
++        output_tile_nd = output_tile
++
++    # Copy PSUM output to SBUF
++    perBankElem = perBankT * T
++    for psum_tiles in TiledRange(dims.H1_shard, perBankT):
++        numElements = psum_tiles.size * T
++
++        if params.quant_params.is_quant_row():
++            # MiMo-V2 fix (T48): the bank's first H1 tile is psum_tiles.start_offset
++            # (= index * perBankT). nkilib used index * psum_tiles.size, which is wrong for a
++            # last bank that is not full (H1_shard % perBankT != 0): those hidden channels got
++            # the scales of other channels.
++            dequant_tile_view = (
++                dequant_tile.slice(dim=1, start=psum_tiles.start_offset, end=psum_tiles.end_offset)
++                .expand_dim(dim=2)
++                .broadcast(dim=2, size=T)
++            )
++        else:
++            dequant_tile_view = dequant_tile
++
++        interleave_copy(
++            index=psum_tiles.index,
++            dst=output_tile_nd.slice(
++                dim=1, start=psum_tiles.index * perBankElem, end=psum_tiles.index * perBankElem + numElements
++            ),
++            src=result_psums[psum_tiles.index][0:H0, 0:numElements],
++            scale=dequant_tile_view,
++            bias=None,
++        )
++
++    # ---------- Apply bias ----------
++    is_bias = bias_tile is not None
++    if is_bias:
++        bias_tile_broadcasted = bias_tile.expand_dim(dim=2).broadcast(dim=2, size=T)
++        output_tile_2d = output_tile_nd
++        nisa.tensor_tensor(
++            dst=output_tile_2d,
++            data1=output_tile_2d,
++            data2=bias_tile_broadcasted,
++            op=nl.add,
++        )
+diff --git a/vllm_neuron/model/mimo_v2/nki_moe_tkg/moe_tkg.py b/vllm_neuron/model/mimo_v2/nki_moe_tkg/moe_tkg.py
+new file mode 100644
+index 0000000..e6de07d
+--- /dev/null
++++ b/vllm_neuron/model/mimo_v2/nki_moe_tkg/moe_tkg.py
+@@ -0,0 +1,522 @@
++# Vendored for MiMo-V2 (T48) from nkilib core/moe/moe_tkg/moe_tkg.py of nki 0.7.0+37713544100.gfede04bb
++# (Neuron SDK 2.33.0 DLAMI). Only change besides the imports: see nki_moe_tkg/__init__.py.
++# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License").
++# You may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""This module implements the Mixture of Experts (MoE) token generation kernel with support for all-expert and selective-expert modes."""
++
++from typing import Optional
++
++import nki
++import nki.isa as nisa
++import nki.language as nl
++
++from nkilib.core.utils.allocator import sizeinbytes
++
++# common utils
++from nkilib.core.utils.common_types import (
++    ActFnType,
++    DtypeMode,
++    ExpertAffinityScaleMode,
++    MoEAllToAllVStrategy,
++    MoEBlockIOLayout,
++    NormType,
++    QuantizationType,
++)
++from nkilib.core.utils.kernel_assert import kernel_assert
++from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
++from .all_expert_impl import _all_expert_moe_tkg
++from nkilib.core.moe.moe_tkg.all_expert_mx_impl import BF16_PER_INT32, _all_expert_moe_tkg_mx
++
++# MLP utils
++from nkilib.core.moe.moe_tkg.mlp_parameters import MLPExpertParameters, MLPParameters, get_T_from_hidden_input
++from nkilib.core.moe.moe_tkg.moe_tkg_affinity_masking import mask_expert_affinities
++from nkilib.core.moe.moe_tkg.selective_expert_impl import _selective_expert_moe_tkg
++from nkilib.core.moe.moe_tkg.selective_expert_mx_impl import _selective_expert_moe_tkg_mxfp4
++
++# Constants
++_SUPPORTED_MX_DTYPES = (nl.float4_e2m1fn_x4, nl.float8_e4m3fn_x4)
++_SUPPORTED_ALLTOALLV_STRATEGIES = (
++    MoEAllToAllVStrategy.DISABLED,
++    MoEAllToAllVStrategy.PRESERVE_ROW_ORDER,
++    MoEAllToAllVStrategy.PACK_OUTPUT_ROWS,
++)
++_MOE_TKG_ERROR_PREFIX = "[MoE TKG Kernel]"
++
++
++@nki.jit
++def moe_tkg(
++    hidden_input: nl.NkiTensor,
++    expert_gate_up_weights: nl.NkiTensor,
++    expert_down_weights: nl.NkiTensor,
++    expert_affinities: nl.NkiTensor,
++    expert_index: nl.NkiTensor,
++    is_all_expert: bool,
++    rank_id: Optional[nl.NkiTensor] = None,
++    expert_gate_up_bias: Optional[nl.NkiTensor] = None,
++    expert_down_bias: Optional[nl.NkiTensor] = None,
++    expert_gate_up_weights_scale: Optional[nl.NkiTensor] = None,
++    expert_down_weights_scale: Optional[nl.NkiTensor] = None,
++    hidden_input_scale: Optional[nl.NkiTensor] = None,
++    expert_gate_up_input_scale: Optional[nl.NkiTensor] = None,
++    expert_down_input_scale: Optional[nl.NkiTensor] = None,
++    mask_unselected_experts: bool = False,
++    expert_affinities_eager: Optional[nl.NkiTensor] = None,
++    expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.NO_SCALE,
++    activation_fn: ActFnType = ActFnType.SiLU,
++    output_dtype: nki.dtype = None,
++    gate_clamp_upper_limit: Optional[float] = None,
++    gate_clamp_lower_limit: Optional[float] = None,
++    up_clamp_upper_limit: Optional[float] = None,
++    up_clamp_lower_limit: Optional[float] = None,
++    output_in_sbuf: bool = False,
++    is_all_expert_dynamic: bool = False,
++    block_size: int = None,
++    input_dequant_scale: Optional[nl.NkiTensor] = None,
++    all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED,
++    output_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
++    output: Optional[nl.NkiTensor] = None,
++    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
++) -> nl.NkiTensor:
++    """
++    Mixture of Experts (MoE) MLP token generation kernel.
++
++    Performs MoE computation with support for both all-expert and selective-expert modes.
++    Supports various quantization types including FP8 row/static quantization and MxFP4.
++    Optimized for token generation scenarios with T <= 128 (except MX all-expert mode).
++
++    Supported input data types: bfloat16, float16, float4_e2m1fn_x4 (MxFP4).
++
++    Dimensions:
++        T: Number of tokens (batch_size * seq_len)
++        H: Hidden dimension
++        I: Intermediate dimension
++        E: Number of global experts
++        E_L: Number of local experts processed by this kernel
++        K: Top-k experts per token
++        I_p: I//4 if I <= 512 else 128
++        H_concat: H + H/4 + E_L * 2 + 4. Number of columns when hidden_input, hidden_input_scale, local expert affinities,
++            and global token index are concatenated and bitcast to a common fp8 dtype.
++
++    Args:
++        hidden_input (nl.NkiTensor): [T, H] or [T, H_concat] in HBM or [H0, T, H1] in SBUF, Input hidden states tensor.
++            When all_to_all_v_strategy != DISABLED, input is expected to have layout [T, H_concat] and fp8 dtype,
++            where H_concat = H + H/4 + E_L * 2 + 4 (hidden_quant | hidden_scale | expert_affinities | token_indices).
++        expert_gate_up_weights (nl.NkiTensor): [E_L, H, 2, I] for bf16/fp16 or [E_L, 128, 2, ceil(H/512), I] for MxFP4,
++            Fused gate and up projection weights.
++        expert_down_weights (nl.NkiTensor): [E_L, I, H] for bf16/fp16 or [E_L, I_p, ceil(I/512), H] for MxFP4,
++            Down projection weights.
++        expert_affinities (nl.NkiTensor): [T, E], Expert routing weights/affinities. None when
++            all_to_all_v_strategy != DISABLED (affinities are packed in hidden_input). For all-expert mode with
++            affinity scaling, this will be sliced to [T, E_L] internally.
++        expert_index (nl.NkiTensor): [T, K], Top-K expert indices per token. None when
++            all_to_all_v_strategy != DISABLED.
++        is_all_expert (bool): If True, process all experts for all tokens; otherwise, process only selected
++            top-k experts.
++        rank_id (nl.NkiTensor, optional): [1, 1], Rank ID tensor specifying which worker processes experts
++            [E_L * rank_id, E_L * (rank_id + 1)). Required for all-expert mode with affinity scaling enabled.
++        expert_gate_up_bias (nl.NkiTensor, optional): [E_L, 2, I] for non-MX or [E_L, I_p, 2, ceil(I/512), 4]
++            for MX, Bias for gate/up projections.
++        expert_down_bias (nl.NkiTensor, optional): [E_L, H], Bias for down projection.
++        expert_gate_up_weights_scale (nl.NkiTensor, optional): [E_L, 2, I] for FP8 row quantization, [E_L, 2, 1] for
++            FP8 static quantization, or [E_L, 128/8, 2, ceil(H/512), I] for MxFP4, Quantization scales for
++            gate/up weights.
++        expert_down_weights_scale (nl.NkiTensor, optional): [E_L, H] for FP8 row quantization, [E_L, 1] for FP8 static
++            quantization, or [E_L, I_p/8, ceil(I/512), H] for MxFP4, Quantization scales for down weights.
++        hidden_input_scale (nl.NkiTensor, optional): [H0, H/512, T], MX quantization scale for pre-quantized
++            hidden_input in SBUF. When provided with MX weights in all-expert mode, indicates that hidden_input
++            is already quantized and skips internal swizzle + quantization. The hidden_input buffer must be in
++            SBUF when hidden_input_scale is provided. dtype: nl.uint8.
++        expert_gate_up_input_scale (nl.NkiTensor, optional): [E_L, 1], FP8 dequantization scales for gate/up input.
++            Used for static quantization.
++        expert_down_input_scale (nl.NkiTensor, optional): [E_L, 1], FP8 dequantization scales for down input. Used for
++            static quantization.
++        mask_unselected_experts (bool): Whether to apply expert affinity masking based on expert_index. When
++            True, affinities are masked to zero for experts not selected by each token. Only used in all-expert
++            mode with affinity scaling. (default: False)
++        expert_affinities_eager (nl.NkiTensor, optional): [T, K], Eager expert affinities. Not used in
++            all_expert mode.
++        expert_affinities_scaling_mode (ExpertAffinityScaleMode): When to apply affinity scaling. Supported
++            values: NO_SCALE, POST_SCALE. (default: NO_SCALE)
++        activation_fn (ActFnType): Activation function type. (default: SiLU)
++        output_dtype: Output tensor data type. Defaults to None.
++            If None, uses hidden_input dtype when hidden_input is a ≥ 2 byte dtype or bf16 when hidden_input is quantized.
++        gate_clamp_upper_limit (float, optional): Upper bound value to clamp gate projection results.
++        gate_clamp_lower_limit (float, optional): Lower bound value to clamp gate projection results.
++        up_clamp_upper_limit (float, optional): Upper bound value to clamp up projection results.
++        up_clamp_lower_limit (float, optional): Lower bound value to clamp up projection results.
++        output_in_sbuf (bool): If True, allocate output in SBUF with same shape as hidden_input. If False
++            (default), allocate output in HBM with shape [T, H].
++        is_all_expert_dynamic (bool): If True, configures all-expert algorithm to use dynamic control flow.
++            If False (default), utilizes all-expert algorithm without dynamic control flow. Only valid when is_all_expert=True.
++        block_size (int): Block size for all-expert dynamic algorithm, used to group tokens for dynamic control flow. Required argument
++            when is_all_expert_dynamic=True. block_size must:
++            - Evenly divide T, resulting in at least 2 blocks.
++            - Be divisible by 4 and ≤ 32, divisible by 32 and ≤ 128, or divisible by 128.
++        input_dequant_scale (nl.NkiTensor, optional): [128, 1] in SBUF, Pre-computed input FP8 dequantization
++            scale for STATIC_MX mode. Passed from moe_block_tkg which computes it during the fused
++            RMSNorm+quantize step. Used by the all-expert MX path to combine with per-expert weight
++            dequant scales for post-matmul dequantization. Derived from expert_gate_up_input_scale.
++        all_to_all_v_strategy (MoEAllToAllVStrategy): Input/output permutation strategy when all_to_all_v (A2A-v) is used.
++            Currently only supported on Trn3 with MX weights.
++            - DISABLED: Default; A2A-v is not used.
++            - PRESERVE_ROW_ORDER: Output row ordering matches input row ordering. Token indices are appended as trailing 2 columns of output.
++            - PACK_OUTPUT_ROWS: Output rows are packed, with routed tokens placed in the first N rows, where N is the number of routed tokens.
++                Final T-N rows are padded with 0s. Token indices are appended as trailing 2 columns of output.
++                When this strategy is used, the final 4 elements of hidden_input must be 0 for all padded rows, and the real token indices must be 1-indexed.
++        output_layout (MoEBlockIOLayout): Output tensor layout. When _128_Nprgs_Hfree_T, output is
++            [128, n_prgs, H//128//n_prgs, T]. Not supported with output_in_sbuf. Default is B_S_H.
++        dtype_mode (DtypeMode): Explicit FP8 E4M3 dtype selection for STATIC/ROW
++            quantization weight tiles (mirrors core/mlp).
++            - ``DtypeMode.NON_OCP`` (default): ``nl.float8_e4m3`` (max=240).
++            - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448). TRN3 only.
++            - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, ``nl.float8_e4m3``
++              elsewhere.
++
++    Returns:
++        output (nl.NkiTensor): [T, H] or [128, n_prgs, H//128//n_prgs, T] depending on output_layout,
++            or same shape as hidden_input if output_in_sbuf=True. Output tensor with
++            MoE computation results.
++
++    Notes:
++        - T <= 128 (batch_size * seq_len must be <= 128, except for MX all-expert mode)
++        - PRE_SCALE and PRE_SCALE_DELAYED modes are not supported
++        - Column tiling is disabled for MoE kernels
++        - STATIC_MX quantization requires MX weights with expert_gate_up_input_scale and expert_down_input_scale
++
++    Pseudocode:
++        # Mask expert affinities if needed (all-expert mode with affinity scaling)
++        if is_all_expert and expert_affinities_scaling_mode != NO_SCALE:
++            masked_expert_affinities = mask_expert_affinities(expert_affinities, expert_index, rank_id)
++
++        # Process experts
++        output = zeros([T, H])
++        for each expert (all-expert) or selected expert (selective-expert):
++            gate_proj_out = hidden_states @ gate_weights
++            act_gate_proj = activation_fn(gate_proj_out)
++            up_proj_out = hidden_states @ up_weights
++            intermediate = act_gate_proj * up_proj_out
++            expert_out = intermediate @ down_weights
++            if expert_affinities_scaling_mode == POST_SCALE:
++                expert_out *= affinity
++            output += expert_out
++    """
++
++    # Extract quantization type
++    quant_type, is_mx_kernel = _extract_quantization_type(
++        expert_gate_up_weights=expert_gate_up_weights,
++        expert_gate_up_weights_scale=expert_gate_up_weights_scale,
++        expert_down_weights_scale=expert_down_weights_scale,
++        expert_gate_up_input_scale=expert_gate_up_input_scale,
++        expert_down_input_scale=expert_down_input_scale,
++    )
++
++    # For all-expert mode with affinity scaling and without A2A-v, mask expert affinities based on rank_id
++    if (
++        is_all_expert
++        and expert_affinities_scaling_mode != ExpertAffinityScaleMode.NO_SCALE
++        and all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED
++    ):
++        kernel_assert(
++            rank_id != None, f"{_MOE_TKG_ERROR_PREFIX} rank_id is required for all-expert mode with affinity scaling"
++        )
++
++        # Get dimensions for masking
++        E_L = expert_gate_up_weights.shape[0]
++        T = get_T_from_hidden_input(hidden_input, hidden_input_scale)
++        K = expert_index.shape[-1]
++
++        masked_expert_affinities = mask_expert_affinities(
++            expert_affinities=expert_affinities,
++            expert_index=expert_index,
++            rank_id=rank_id,
++            E_L=E_L,
++            T=T,
++            K=K,
++            io_dtype=expert_affinities.dtype,
++            mask_unselected_experts=mask_unselected_experts,
++            output_in_sbuf=not is_all_expert_dynamic,
++        )
++    else:
++        masked_expert_affinities = expert_affinities
++
++    # Initialize config objects
++    expert_params = MLPExpertParameters(
++        expert_affinities=masked_expert_affinities,
++        expert_index=expert_index,
++        expert_affinities_eager=expert_affinities_eager,
++        expert_affinities_scaling_mode=expert_affinities_scaling_mode,
++        is_all_expert_dynamic=is_all_expert_dynamic,
++        all_to_all_v_strategy=all_to_all_v_strategy,
++        block_size=block_size,
++    )
++
++    # Default output_dtype to hidden_input.dtype when hidden_input is not quantized, and bf16 when hidden_input is quantized.
++    if output_dtype is None:
++        output_dtype = hidden_input.dtype if sizeinbytes(hidden_input.dtype) >= 2 else nl.bfloat16
++
++    # Column tiling improves PE utilization for small T (32, 64, 128) but requires:
++    #   - Quantized weights (FP8): unquantized bf16/fp16 weights are not supported
++    #   - 32 <= T <= 128: the column tiling path does not tile on the T dimension
++    #   - Non-MX quantization: MX path has its own path
++    T_for_heuristic = get_T_from_hidden_input(hidden_input, hidden_input_scale)
++    _use_gate_up_col_tiling = (
++        is_all_expert
++        and not is_mx_kernel
++        and quant_type in (QuantizationType.STATIC,)
++        and 32 <= T_for_heuristic
++        and T_for_heuristic <= 128
++    )
++
++    mlp_params = MLPParameters(
++        hidden_tensor=hidden_input,
++        gate_proj_weights_tensor=expert_gate_up_weights,
++        up_proj_weights_tensor=expert_gate_up_weights,
++        down_proj_weights_tensor=expert_down_weights,
++        activation_fn=activation_fn,
++        normalization_type=NormType.NO_NORM,
++        gate_proj_bias_tensor=expert_gate_up_bias,
++        up_proj_bias_tensor=expert_gate_up_bias,
++        down_proj_bias_tensor=expert_down_bias,
++        gate_w_scale=expert_gate_up_weights_scale,
++        up_w_scale=expert_gate_up_weights_scale,
++        down_w_scale=expert_down_weights_scale,
++        gate_up_in_scale=expert_gate_up_input_scale,
++        down_in_scale=expert_down_input_scale,
++        hidden_input_scale=hidden_input_scale,
++        input_dequant_scale=input_dequant_scale,
++        output_dtype=output_dtype,
++        use_tkg_gate_up_proj_column_tiling=_use_gate_up_col_tiling,
++        use_tkg_down_proj_column_tiling=False,
++        shard_on_h_disabled=is_mx_kernel and not is_all_expert,
++        expert_params=expert_params,
++        gate_clamp_upper_limit=gate_clamp_upper_limit,
++        gate_clamp_lower_limit=gate_clamp_lower_limit,
++        up_clamp_upper_limit=up_clamp_upper_limit,
++        up_clamp_lower_limit=up_clamp_lower_limit,
++        quantization_type=quant_type,
++        transposed_out=output_layout == MoEBlockIOLayout._128_Nprgs_Hfree_T,
++        dtype_mode=dtype_mode,
++    )
++
++    T = mlp_params.sequence_len
++    H = mlp_params.hidden_size
++
++    # Validate inputs
++    _validate_moe_tkg_inputs(
++        T=T,
++        is_all_expert=is_all_expert,
++        is_all_expert_dynamic=is_all_expert_dynamic,
++        all_to_all_v_strategy=all_to_all_v_strategy,
++        block_size=block_size,
++        is_mx_kernel=is_mx_kernel,
++        expert_weight_dtype=expert_gate_up_weights.dtype,
++        expert_gate_up_weights_scale=expert_gate_up_weights_scale,
++        expert_down_weights_scale=expert_down_weights_scale,
++        hidden_input_scale=hidden_input_scale,
++        expert_affinities_scaling_mode=expert_affinities_scaling_mode,
++        expert_gate_up_input_scale=expert_gate_up_input_scale,
++        expert_down_input_scale=expert_down_input_scale,
++        expert_affinities_eager=expert_affinities_eager,
++        output_dtype=output_dtype,
++    )
++
++    # Allocate output tensor if not provided by caller
++    _T_LAYOUT = MoEBlockIOLayout._128_Nprgs_Hfree_T
++    kernel_assert(
++        not (output_layout == _T_LAYOUT and output_in_sbuf),
++        f"{_MOE_TKG_ERROR_PREFIX} output_layout=_128_Nprgs_Hfree_T is not supported with output_in_sbuf=True",
++    )
++    if output is None:
++        if output_in_sbuf:
++            output = nl.ndarray(hidden_input.shape, dtype=output_dtype, buffer=nl.sbuf)
++        elif output_layout == _T_LAYOUT:
++            _, n_prgs, _ = get_verified_program_sharding_info("moe_tkg", (0, 1))
++            H0 = 128
++            H1_shard = H // (H0 * n_prgs)
++            output = nl.ndarray((H0, n_prgs, H1_shard, T), dtype=output_dtype, buffer=nl.shared_hbm)
++        elif all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED:
++            output = nl.ndarray((T, H), dtype=output_dtype, buffer=nl.shared_hbm)
++        else:
++            # We add BF16_PER_INT32 additional columns to end when using all_to_all_v, to store concatenated token indices
++            output = nl.ndarray((T, H + BF16_PER_INT32), dtype=output_dtype, buffer=nl.shared_hbm)
++
++    # Dispatch to expert MLP implementation
++    if is_all_expert:
++        if is_mx_kernel:
++            _all_expert_moe_tkg_mx(mlp_params, output, output_t_offset=0)
++        else:
++            _all_expert_moe_tkg(mlp_params, output)
++    else:
++        if is_mx_kernel:
++            _selective_expert_moe_tkg_mxfp4(mlp_params, output)
++        else:
++            _selective_expert_moe_tkg(mlp_params, output)
++
++    return output
++
++
++def _extract_quantization_type(
++    expert_gate_up_weights: nl.NkiTensor,
++    expert_gate_up_weights_scale: Optional[nl.NkiTensor],
++    expert_down_weights_scale: Optional[nl.NkiTensor],
++    expert_gate_up_input_scale: Optional[nl.NkiTensor],
++    expert_down_input_scale: Optional[nl.NkiTensor],
++) -> tuple[QuantizationType, bool]:
++    """
++    Extract quantization type from kernel parameters.
++
++    Args:
++        expert_gate_up_weights (nl.NkiTensor): Gate/up projection weights tensor.
++        expert_gate_up_weights_scale (nl.NkiTensor, optional): Quantization scale for gate/up weights.
++        expert_down_weights_scale (nl.NkiTensor, optional): Quantization scale for down weights.
++        expert_gate_up_input_scale (nl.NkiTensor, optional): FP8 dequantization scale for gate/up input.
++        expert_down_input_scale (nl.NkiTensor, optional): FP8 dequantization scale for down input.
++
++    Returns:
++        tuple[QuantizationType, bool]: (quant_type, is_mx_kernel) tuple indicating the detected
++            quantization type and whether MX quantization is used.
++    """
++
++    quant_type = QuantizationType.NONE
++    is_mx_kernel = False
++    if expert_gate_up_weights.dtype in _SUPPORTED_MX_DTYPES:
++        is_mx_kernel = True
++        if expert_gate_up_input_scale != None and expert_down_input_scale != None:
++            quant_type = QuantizationType.STATIC_MX
++        elif (
++            expert_gate_up_weights_scale != None
++            and expert_down_weights_scale != None
++            and expert_gate_up_weights_scale.dtype != nl.uint8
++            and expert_gate_up_weights_scale.shape[-1] > 1
++        ):
++            quant_type = QuantizationType.ROW_MX
++        else:
++            quant_type = QuantizationType.MX
++    elif expert_gate_up_input_scale != None and expert_down_input_scale != None:
++        quant_type = QuantizationType.STATIC
++    elif expert_gate_up_weights_scale != None and expert_down_weights_scale != None:
++        quant_type = QuantizationType.ROW
++
++    return quant_type, is_mx_kernel
++
++
++def _validate_moe_tkg_inputs(
++    T: int,
++    is_all_expert: bool,
++    is_all_expert_dynamic: bool,
++    all_to_all_v_strategy: MoEAllToAllVStrategy,
++    block_size: int,
++    is_mx_kernel: bool,
++    expert_weight_dtype: nki.dtype,
++    expert_gate_up_weights_scale: Optional[nl.NkiTensor],
++    expert_down_weights_scale: Optional[nl.NkiTensor],
++    hidden_input_scale: Optional[nl.NkiTensor],
++    expert_affinities_scaling_mode: ExpertAffinityScaleMode,
++    expert_gate_up_input_scale: Optional[nl.NkiTensor],
++    expert_down_input_scale: Optional[nl.NkiTensor],
++    expert_affinities_eager: Optional[nl.NkiTensor],
++    output_dtype: nki.dtype,
++) -> None:
++    """
++    Validate MoE TKG kernel input parameters.
++
++    Args:
++        T (int): Number of tokens.
++        is_all_expert (bool): Whether using all-expert mode.
++        is_all_expert_dynamic (bool): Whether all-expert mode uses dynamic control flow.
++        is_all_to_all_v (bool): Whether MoE layer uses all_to_all_v collective, which provides sparse input and requires shuffled output.
++        is_mx_kernel (bool): Whether using MX quantization.
++        expert_gate_up_weights_scale (nl.NkiTensor, optional): Quantization scale for gate/up weights.
++        expert_down_weights_scale (nl.NkiTensor, optional): Quantization scale for down weights.
++        hidden_input_scale (nl.NkiTensor, optional): MX quantization scale for hidden input.
++        expert_affinities_scaling_mode (ExpertAffinityScaleMode): When to apply affinity scaling.
++        expert_gate_up_input_scale (nl.NkiTensor, optional): FP8 dequantization scale for gate/up input.
++        expert_down_input_scale (nl.NkiTensor, optional): FP8 dequantization scale for down input.
++        expert_affinities_eager (nl.NkiTensor, optional): Eager expert affinities.
++        output_dtype (nki.dtype): Resolved output dtype (must be at least 2 bytes).
++
++    Returns:
++        None
++    """
++    # MX quantization requires scales
++    if is_mx_kernel:
++        kernel_assert(
++            expert_gate_up_weights_scale != None and expert_down_weights_scale != None,
++            f"{_MOE_TKG_ERROR_PREFIX} Scales must be set when using MX weights",
++        )
++        kernel_assert(
++            nisa.get_nc_version() >= nisa.nc_version.gen4,
++            f"{_MOE_TKG_ERROR_PREFIX} MX weights are only supported on gen4+ (Trn3+) but got {nisa.get_nc_version()=}",
++        )
++
++    # Dynamic control flow requires is_all_expert=True and block_size != None
++    if is_all_expert_dynamic:
++        kernel_assert(
++            is_all_expert,
++            f"{_MOE_TKG_ERROR_PREFIX} is_all_expert_dynamic=True requires is_all_expert=True, but got {is_all_expert=}",
++        )
++        kernel_assert(
++            block_size != None,
++            f"{_MOE_TKG_ERROR_PREFIX} is_all_expert_dynamic=True requires block_size != None, but got {block_size=}",
++        )
++        # Validate all_to_all_v_strategy supported with dynamic control flow
++        kernel_assert(
++            all_to_all_v_strategy in _SUPPORTED_ALLTOALLV_STRATEGIES,
++            f"{_MOE_TKG_ERROR_PREFIX} Unsupported all_to_all_v_strategy={all_to_all_v_strategy}. Supported: {_SUPPORTED_ALLTOALLV_STRATEGIES}",
++        )
++    # all_to_all_v requires is_all_expert_dynamic
++    else:
++        kernel_assert(
++            all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED,
++            f"{_MOE_TKG_ERROR_PREFIX} all_to_all_v_strategy != DISABLED is only supported with is_all_expert_dynamic=True, but got {is_all_expert_dynamic=}, {all_to_all_v_strategy=}",
++        )
++
++    # hidden_input_scale only supported with MX weights in ALL_EXPERT mode
++    kernel_assert(
++        hidden_input_scale == None or (is_mx_kernel and is_all_expert),
++        f"{_MOE_TKG_ERROR_PREFIX} hidden_input_scale is only supported with MX weights in all-expert mode",
++    )
++
++    # Token count limitation (except for all-expert mode which supports T-tiling)
++    kernel_assert(
++        T <= 128 or is_all_expert,
++        f"{_MOE_TKG_ERROR_PREFIX} Currently only batch size * seq len <= 128 is supported (except for all-expert mode)",
++    )
++
++    # Affinity scaling mode restrictions
++    kernel_assert(
++        expert_affinities_scaling_mode != ExpertAffinityScaleMode.PRE_SCALE_DELAYED,
++        f"{_MOE_TKG_ERROR_PREFIX} PRE_SCALE_DELAYED option is only applicable in CTE expert_mlp case",
++    )
++
++    kernel_assert(
++        expert_affinities_scaling_mode != ExpertAffinityScaleMode.PRE_SCALE,
++        f"{_MOE_TKG_ERROR_PREFIX} Kernel does not support pre-scale mode",
++    )
++
++    kernel_assert(
++        sizeinbytes(output_dtype) >= 2,
++        f"{_MOE_TKG_ERROR_PREFIX} output_dtype must be at least a 2-byte dtype, got {output_dtype}",
++    )
++
++    # Static quantization without MX weights: input stays BF16, TRN2 does BF16 × FP8 matmul.
++    # gate_up_in_scale / down_in_scale are passed for detection but not used in the kernel.
++
++    # All-expert mode restrictions
++    if is_all_expert:
++        kernel_assert(
++            expert_affinities_eager == None,
++            f"{_MOE_TKG_ERROR_PREFIX} expert_affinities eager mode not supported with is_all_expert=True",
++        )
+diff --git a/vllm_neuron/model/mimo_v2/nki_moe_tkg/moe_tkg_hits_batch.py b/vllm_neuron/model/mimo_v2/nki_moe_tkg/moe_tkg_hits_batch.py
+new file mode 100644
+index 0000000..de44bc2
+--- /dev/null
++++ b/vllm_neuron/model/mimo_v2/nki_moe_tkg/moe_tkg_hits_batch.py
+@@ -0,0 +1,268 @@
++# SPDX-License-Identifier: Apache-2.0
++# Vendored for MiMo-V2 FP8 decode (T53 prep) from vllm-neuron PR #67
++# (https://github.com/vllm-project/vllm-neuron/pull/67, whn09/vllm-neuron contrib-mimo-v2-5 a05ad1837fbf),
++# contrib/models/mimo_v2_5/src/kernels/moe_tkg_hits_batch.py. Only change: process_down_projection is
++# imported from the vendored nki_moe_tkg copy, whose down projection has the FP8 row-scale PSUM bank
++# offset fixed (nki_moe_tkg/__init__.py, D-209); the nkilib original computes the wrong scales on
++# T-tiles of 33-56, 65-102 and 129-170 rows.
++# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License").
++# You may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# Derived from nkilib.core.moe.moe_tkg.all_expert_impl (nkilib 2.33).
++
++"""Small-batch MoE decode over the local experts that any token in the batch routed to.
++
++``moe_tkg``'s all-expert mode computes every local expert for every token. At
++a few tokens per step most local experts get no token at all. Here the caller
++packs the local experts that at least one token routed to first, reorders the
++affinity columns the same way, and passes the count; the kernel loops over
++that many experts at runtime (``nl.fori_loop`` on a register). Each expert's
++weights are read once for the whole batch and its output is scaled per token
++by that token's affinity (0 for tokens that did not route to it).
++
++Each iteration processes expert slot 0 and then shifts the expert list and
++the affinity columns left by one, so every access pattern inside the loop is
++static.
++"""
++
++from typing import Optional
++
++import nki
++import nki.isa as nisa
++import nki.language as nl
++
++from nkilib.core.moe.moe_tkg.mlp_parameters import (
++    MLPBiasParameters,
++    MLPExpertParameters,
++    MLPParameters,
++    MLPQuantizationParameters,
++)
++from nkilib.core.moe.moe_tkg.mlp_tkg_constants import MLPTKGConstants
++from .mlp_tkg_down_projection import process_down_projection  # vendored, FP8 row-scale fix (T48)
++from nkilib.core.moe.moe_tkg.mlp_tkg_gate_up_projection import process_gate_up_projection
++from nkilib.core.moe.moe_tkg.moe_tkg import _extract_quantization_type
++from nkilib.core.moe.moe_tkg.moe_tkg_utils import broadcast_all_expert_affinity
++from nkilib.core.moe.moe_tkg.projection_utils import input_norm_load, transpose_store
++from nkilib.core.moe.moe_tkg.selective_expert_impl import _select_quant_scales
++from nkilib.core.utils.allocator import SbufManager
++from nkilib.core.utils.common_types import (
++    ActFnType,
++    ExpertAffinityScaleMode,
++    GateUpDim,
++    NormType,
++    QuantizationType,
++)
++from nkilib.core.utils.kernel_helpers import div_ceil
++from nkilib.core.utils.logging import get_logger
++from nkilib.core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
++
++
++@nki.jit
++def moe_tkg_hits_batch(
++    hidden_input: nl.NkiTensor,
++    expert_gate_up_weights: nl.NkiTensor,
++    expert_down_weights: nl.NkiTensor,
++    expert_affinities: nl.NkiTensor,
++    expert_index: nl.NkiTensor,
++    num_hits: nl.NkiTensor,
++    expert_gate_up_weights_scale: Optional[nl.NkiTensor] = None,
++    expert_down_weights_scale: Optional[nl.NkiTensor] = None,
++    expert_gate_up_input_scale: Optional[nl.NkiTensor] = None,
++    expert_down_input_scale: Optional[nl.NkiTensor] = None,
++    activation_fn: ActFnType = ActFnType.SiLU,
++):
++    """MoE MLP for T tokens over the ``num_hits`` local experts they routed to.
++
++    Args:
++        hidden_input: [T, H] in HBM, T <= 128.
++        expert_gate_up_weights: [E_L, H, 2, I].
++        expert_down_weights: [E_L, I, H].
++        expert_affinities: [T, E_L] fp32; column j is the affinity of every
++            token for the expert in ``expert_index[0, j]`` (0 if not routed).
++        expert_index: [1, E_L] int32 local expert ids, routed experts first.
++        num_hits: [1, 1] int32, number of leading experts to run.
++        expert_*_scale: FP8 row or static scales, as for ``moe_tkg``.
++
++    Returns:
++        [T, H] in HBM: for each token, the sum over the hit experts of
++        affinity * expert(hidden).
++    """
++    quant_type, is_mx = _extract_quantization_type(
++        expert_gate_up_weights=expert_gate_up_weights,
++        expert_gate_up_weights_scale=expert_gate_up_weights_scale,
++        expert_down_weights_scale=expert_down_weights_scale,
++        expert_gate_up_input_scale=expert_gate_up_input_scale,
++        expert_down_input_scale=expert_down_input_scale,
++    )
++    assert not is_mx, "moe_tkg_hits_batch: MX weights are not supported"
++    assert hidden_input.shape[0] <= 128, "moe_tkg_hits_batch: at most 128 tokens"
++    assert num_hits.dtype == nl.int32, "moe_tkg_hits_batch: num_hits must be int32"
++    assert expert_index.dtype == nl.int32, "moe_tkg_hits_batch: expert_index must be int32"
++    assert expert_affinities.dtype == nl.float32, "moe_tkg_hits_batch: affinities must be fp32"
++
++    params = MLPParameters(
++        hidden_tensor=hidden_input,
++        gate_proj_weights_tensor=expert_gate_up_weights,
++        up_proj_weights_tensor=expert_gate_up_weights,
++        down_proj_weights_tensor=expert_down_weights,
++        activation_fn=activation_fn,
++        normalization_type=NormType.NO_NORM,
++        gate_w_scale=expert_gate_up_weights_scale,
++        up_w_scale=expert_gate_up_weights_scale,
++        down_w_scale=expert_down_weights_scale,
++        gate_up_in_scale=expert_gate_up_input_scale,
++        down_in_scale=expert_down_input_scale,
++        output_dtype=hidden_input.dtype,
++        use_tkg_gate_up_proj_column_tiling=False,
++        use_tkg_down_proj_column_tiling=False,
++        shard_on_h_disabled=False,
++        expert_params=MLPExpertParameters(
++            expert_affinities=expert_affinities,
++            expert_index=expert_index,
++            expert_affinities_eager=None,
++            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
++        ),
++        quantization_type=quant_type,
++    )
++    output = nl.ndarray(hidden_input.shape, dtype=hidden_input.dtype, buffer=nl.shared_hbm)
++    _hit_expert_batch(params, num_hits, output)
++    return output
++
++
++def _hit_expert_batch(params: MLPParameters, num_hits: nl.NkiTensor, output: nl.NkiTensor):
++    T, H = params.hidden_tensor.shape
++    sbm = SbufManager(0, 200 * 1024, get_logger("hit_expert_batch"), use_auto_alloc=H >= 16 * 1024)
++    sbm.open_scope()
++    allocator = sbm.alloc_stack
++
++    io_dtype = params.hidden_tensor.dtype
++    expert_affinities = params.expert_params.expert_affinities
++    dims = MLPTKGConstants.calculate_constants(params)
++    E = dims.E
++    num_I_tiles = div_ceil(dims.I, dims.I0)
++
++    input_sb = allocator([dims.H0, T, dims.H1_shard], dtype=io_dtype, buffer=nl.sbuf, name="input_sb")
++    input_norm_load(params.hidden_tensor, input_sb, params, dims, sbm=sbm)
++
++    # Accumulator, zeroed so a batch with no local hit returns 0.
++    output_temp = allocator((dims.H0, dims.H1_shard, T), dtype=io_dtype, buffer=nl.sbuf, name="out_acc")
++    nisa.memset(output_temp, value=0.0)
++    gate_up_output = allocator((dims.I0, num_I_tiles, T), dtype=io_dtype, buffer=nl.sbuf, name="gate_up_sb")
++    down_sb = allocator((dims.H0, dims.H1_shard, T), dtype=io_dtype, buffer=nl.sbuf, name="down_sb")
++    # Gate/up fp32 accumulators live outside the loop (NCC_IGCA108, see moe_tkg_hits).
++    gate_up_fp32 = tuple(nl.ndarray((dims.I0, num_I_tiles, T), dtype=nl.float32, buffer=nl.sbuf) for _ in range(2))
++    identity_sb = nl.shared_identity_matrix(T, dtype=io_dtype)
++
++    # Expert list and affinity columns, shifted left by one per iteration.
++    expert_idx = allocator((1, E), dtype=nl.int32, buffer=nl.sbuf, name="hit_idx")
++    nisa.dma_copy(dst=expert_idx, src=params.expert_params.expert_index[0:1, 0:E])
++    idx_shift = allocator((1, E), dtype=nl.int32, buffer=nl.sbuf, name="hit_idx_shift")
++    aff_sb = allocator((T, E), dtype=expert_affinities.dtype, buffer=nl.sbuf, name="aff_sb")
++    nisa.dma_copy(dst=aff_sb[:T, :E], src=expert_affinities[:T, :E])
++    aff_shift = allocator((T, E), dtype=expert_affinities.dtype, buffer=nl.sbuf, name="aff_shift")
++
++    n_sb = allocator((1, 1), dtype=nl.int32, buffer=nl.sbuf, name="num_hits_sb")
++    nisa.dma_copy(dst=n_sb, src=num_hits[0:1, 0:1])
++    n_reg = nisa.register_alloc()
++    nisa.register_load(src=n_sb, dst=n_reg)
++
++    initial_gate = params.gate_proj_weights_tensor
++    initial_up = params.up_proj_weights_tensor
++    initial_down = params.down_proj_weights_tensor
++    initial_quant = params.quant_params
++    params.bias_params = MLPBiasParameters(None, None, None)
++    dims.T = T
++
++    def _body(_):
++        sbm.open_scope()
++        slot0 = expert_idx.ap(pattern=[[E, 1], [1, 1]], offset=0)
++        params.gate_proj_weights_tensor = initial_gate.select(dim=0, index=slot0).select(
++            dim=1, index=GateUpDim.GATE.value
++        )
++        params.up_proj_weights_tensor = initial_up.select(dim=0, index=slot0).select(dim=1, index=GateUpDim.UP.value)
++        params.down_proj_weights_tensor = initial_down.select(dim=0, index=slot0)
++        params.quant_params = _select_quant_scales(initial_quant, slot0)
++
++        if initial_quant.quantization_type == QuantizationType.STATIC:
++            # Per-expert scalar scales: load to partition 0, broadcast on chip (as selective_expert_impl).
++            gate_w_dq = nl.ndarray((dims._pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
++            up_w_dq = nl.ndarray((dims._pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
++            down_w_dq = nl.ndarray((dims._pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.dma_copy(dst=gate_w_dq[0:1, 0:1], src=params.quant_params.gate_w_scale.slice(dim=0, start=0, end=1))
++            stream_shuffle_broadcast(gate_w_dq, gate_w_dq)
++            nisa.dma_copy(dst=up_w_dq[0:1, 0:1], src=params.quant_params.up_w_scale.slice(dim=0, start=0, end=1))
++            stream_shuffle_broadcast(up_w_dq, up_w_dq)
++            nisa.dma_copy(dst=down_w_dq[0:1, 0:1], src=params.quant_params.down_w_scale.slice(dim=0, start=0, end=1))
++            stream_shuffle_broadcast(down_w_dq, down_w_dq)
++            params.quant_params = MLPQuantizationParameters(
++                quantization_type=QuantizationType.STATIC,
++                gate_w_scale=gate_w_dq,
++                up_w_scale=up_w_dq,
++                down_w_scale=down_w_dq,
++                gate_up_in_scale=None,
++                down_in_scale=None,
++                clipping_bound=params.quant_params.clipping_bound,
++            )
++
++        gate_tile_info = process_gate_up_projection(
++            hidden=input_sb,
++            output=gate_up_output,
++            params=params,
++            dims=dims,
++            sbm=sbm,
++            share_memory_scope=True,
++            use_dge=True,
++            prealloc_gate_up_buffers=gate_up_fp32,
++        )
++        process_down_projection(
++            hidden=gate_up_output,
++            output=down_sb,
++            params=params,
++            dims=dims,
++            gate_tile_info=gate_tile_info,
++            sbm=sbm,
++            use_dge=True,
++        )
++
++        # Column 0 of the affinities, broadcast over partitions: [pmax, T].
++        aff_b = broadcast_all_expert_affinity(
++            aff_sb, 1, 0, 0, T, io_dtype, identity_sb, dims, allocator, sbm.use_auto_alloc
++        )
++        for shard in range(dims.H1_shard):
++            nisa.tensor_tensor(
++                data1=down_sb[: dims.H0, shard, :T],
++                data2=aff_b,
++                op=nl.multiply,
++                dst=down_sb[: dims.H0, shard, :T],
++            )
++        nisa.tensor_tensor(
++            data1=down_sb[: dims.H0, : dims.H1_shard, :T],
++            data2=output_temp[: dims.H0, : dims.H1_shard, :T],
++            op=nl.add,
++            dst=output_temp[: dims.H0, : dims.H1_shard, :T],
++        )
++
++        # Next expert moves to slot 0.
++        nisa.tensor_copy(dst=idx_shift[0:1, 0 : E - 1], src=expert_idx[0:1, 1:E])
++        nisa.tensor_copy(dst=expert_idx[0:1, 0 : E - 1], src=idx_shift[0:1, 0 : E - 1])
++        nisa.tensor_copy(dst=aff_shift[:T, 0 : E - 1], src=aff_sb[:T, 1:E])
++        nisa.tensor_copy(dst=aff_sb[:T, 0 : E - 1], src=aff_shift[:T, 0 : E - 1])
++        sbm.close_scope()
++
++    nl.fori_loop(0, n_reg, _body)
++
++    dims.T = T
++    transpose_store(output_temp, output, dims, params.output_dtype, sbm, 0)
++    sbm.close_scope()
++    return output
+-- 
+2.54.0 (Apple Git-157)
+

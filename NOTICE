@@ -1,0 +1,58 @@
+mimo-v2.6-flash-vllm-neuron-pytorch-native
+Copyright 2026 The mimo-v2.6-flash-vllm-neuron-pytorch-native Authors
+
+This project is licensed under the Apache License, Version 2.0 (see LICENSE).
+It contains code adapted from, or written with reference to, the third-party projects listed below.
+
+-------------------------------------------------------------------------------
+1. vllm-project/vllm-neuron  (Apache License 2.0)
+   https://github.com/vllm-project/vllm-neuron  (release-0.29.0.1.2.0, commit eb6cb36)
+-------------------------------------------------------------------------------
+  patches/vllm-neuron/*.patch are changes to vllm-neuron and contain context lines of its source files.
+  vllm-neuron itself is not redistributed here: scripts/setup_source.sh clones it from GitHub at the pinned
+  commit and applies the patches.
+  0001 modifies existing vllm-neuron modules; 0003 adds the MiMo-V2 model package and its NKI kernels, which
+  follow the structure of the existing vllm-neuron model packages.
+
+-------------------------------------------------------------------------------
+2. nkilib, the NKI kernel library installed with the AWS Neuron SDK  (Apache License 2.0)
+-------------------------------------------------------------------------------
+  patches/vllm-neuron/0002-*.patch adds vllm_neuron/model/mimo_v2/nki_moe_tkg/, a copy of the moe_tkg
+  (MoE token generation) kernels of nkilib (nki 0.7.0, Neuron SDK 2.33.0) with an all-expert path and a
+  fix of the PSUM bank offset of the FP8 row scales.
+
+-------------------------------------------------------------------------------
+3. vLLM  (Apache License 2.0)
+   https://github.com/vllm-project/vllm  (version 0.29.0)
+-------------------------------------------------------------------------------
+  Runtime dependency (installed from requirements/serve-freeze.txt); no vLLM source is copied. The MiMo-V2
+  processor, the mimo reasoning / tool parsers and the OpenAI-compatible server are used unmodified.
+
+-------------------------------------------------------------------------------
+4. XiaomiMiMo/MiMo-V2.6-Flash-MOPD  (model repository card: MIT License)
+   https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD  (revision b12f5573350bb1704513fcf119fca48e498b0423)
+   Copyright 2026 Xiaomi Corporation.
+-------------------------------------------------------------------------------
+  The text backbone, vision encoder, audio towers, MTP and DFlash draft modules in patch 0003 follow the maths
+  of the model's remote code (modeling_mimo_v2.py, Apache License 2.0 header); they are independent
+  implementations for vllm-neuron. Model weights are not included and are subject to the model repository's
+  license.
+
+-------------------------------------------------------------------------------
+5. terrificdm/mimo-v2.6-flash-vllm-neuron-pytorch-xla  (Apache License 2.0)
+   https://github.com/terrificdm/mimo-v2.6-flash-vllm-neuron-pytorch-xla
+-------------------------------------------------------------------------------
+  The earlier deployment of the same model with the vllm-neuron PyTorch/XLA backend, by the same authors.
+  Copied, then adapted: the HTTP client scripts scripts/api_tests/{ask,common,needle,prefix_cache_test,task_eval}.py,
+  the repository checks scripts/dev/*, and the test media in assets/ (see 6).
+
+-------------------------------------------------------------------------------
+6. Test media and evaluation data
+-------------------------------------------------------------------------------
+  assets/audio/jfk.wav: excerpt of the 1961 inaugural address of John F. Kennedy (a work of the U.S.
+      federal government, public domain), from the Hugging Face dataset Xenova/transformers.js-docs, resampled.
+  All other files in assets/ are synthetic (rendered digits, shapes and tones).
+  data/task_eval/gsm8k_test_200_seed0.jsonl: 200 questions of the GSM8K test split (MIT License,
+      https://github.com/openai/grade-school-math), selected with random.Random(0).
+  data/task_eval/mmlu_test_200_seed0.jsonl: 200 questions of the MMLU test split (MIT License,
+      https://github.com/hendrycks/test), selected with random.Random(0).

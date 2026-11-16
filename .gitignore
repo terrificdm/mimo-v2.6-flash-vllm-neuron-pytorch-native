@@ -1,0 +1,45 @@
+# Secrets and environment
+*.pem
+*.key
+.env
+.env.*
+
+# Model weights and tensor dumps (download instead; never commit)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+*.npy
+
+# Hugging Face cache, venvs, source checkouts and compile caches (they live under MIMO_ROOT, not in the repository)
+hf/
+hf-cache/
+.cache/
+venv/
+.venv/
+src/
+cache/
+neuron-compile-cache/
+*.neff
+*.ntff
+*.parquet
+
+# Logs and run outputs
+*.log
+*.log.gz
+logs/
+run/
+tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# OS / editor
+.DS_Store
+._*

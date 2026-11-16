@@ -1,0 +1,6 @@
+# The patches are checked against sha256 values in sources.lock.json: keep them byte-exact.
+*.patch -text
+# Binary test assets
+*.png binary
+*.mp4 binary
+*.wav binary

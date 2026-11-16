@@ -1,0 +1,370 @@
+{
+ "description": "vllm serve configurations for MiMo-V2.6-Flash-MOPD on one trn2.48xlarge with the vllm-neuron PyTorch native backend. scripts/serve.sh renders a profile and speculative option into the full command (scripts/render_serve_args.py). ${HF_SNAPSHOT} = the downloaded checkpoint directory, ${REPO_DIR} = this repository, ${MEDIA_DIR} = directory the server may read file:// media from.",
+ "schema": 1,
+ "default_profile": "1m",
+ "env": {
+  "VLLM_NEURON_BACKEND": "neuron_native",
+  "NEURON_LOGICAL_NC_CONFIG": "2",
+  "NEURON_SKIP_EFA_AFFINITY": "1",
+  "VLLM_NEURON_SWITCH_CC": "1",
+  "TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT": "43200",
+  "NEURON_LIBTORCH_PARALLEL_TRACE_WORKERS": "12",
+  "VLLM_RPC_TIMEOUT": "1800000"
+ },
+ "common_args": [
+  "--served-model-name",
+  "mimo-v2.6-flash",
+  "--host",
+  "127.0.0.1"
+ ],
+ "profiles": {
+  "1m": {
+   "description": "Recommended: 1M context, text + image + video + audio in one server, prefix caching, up to 8 concurrent requests, MTP k=3 by default.",
+   "args": [
+    "--trust-remote-code",
+    "--reasoning-parser",
+    "mimo",
+    "--tool-call-parser",
+    "mimo",
+    "--enable-auto-tool-choice",
+    "--generation-config",
+    "vllm",
+    "--tensor-parallel-size",
+    "64",
+    "--enable-expert-parallel",
+    "--max-model-len",
+    "1048576",
+    "--max-num-batched-tokens",
+    "8192",
+    "--max-num-seqs",
+    "8",
+    "--num-gpu-blocks-override",
+    "38587",
+    "--enable-prefix-caching",
+    "--prefix-cache-retention-interval",
+    "1024",
+    "--limit-mm-per-prompt",
+    "{\"image\": 64, \"video\": 4, \"audio\": 8}",
+    "--allowed-local-media-path",
+    "${MEDIA_DIR}"
+   ],
+   "neuron_config": {
+    "quantization": "fp8",
+    "num_batched_tokens_buckets": [
+     512,
+     1024,
+     8192
+    ],
+    "num_seqs_buckets": [
+     1,
+     4,
+     8
+    ],
+    "on_device_sampling_config": {
+     "all_greedy": false
+    },
+    "mimo_attn_kernel": "nki",
+    "mimo_expert_placement": "${REPO_DIR}/config/placement3_s5.json"
+   },
+   "speculative": {
+    "default": "mtp3",
+    "options": {
+     "off": null,
+     "mtp1": {
+      "config": {
+       "method": "mtp",
+       "num_speculative_tokens": 1
+      }
+     },
+     "mtp2": {
+      "config": {
+       "method": "mtp",
+       "num_speculative_tokens": 2
+      }
+     },
+     "mtp3": {
+      "config": {
+       "method": "mtp",
+       "num_speculative_tokens": 3
+      }
+     },
+     "dflash": {
+      "config": {
+       "method": "dflash",
+       "model": "${HF_SNAPSHOT}/dflash",
+       "num_speculative_tokens": 7
+      },
+      "overrides": {
+       "args": {
+        "--num-gpu-blocks-override": 71772
+       },
+       "env": {
+        "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION": "0.31"
+       },
+       "drop_neuron_config": [
+        "mimo_expert_placement"
+       ]
+      }
+     }
+    }
+   }
+  },
+  "1m_c4": {
+   "description": "As 1m with max-num-seqs 4 and decode buckets [1, 4]: lower latency at concurrency <= 4, lower throughput at concurrency 8. Needs its own first compile.",
+   "args": [
+    "--trust-remote-code",
+    "--reasoning-parser",
+    "mimo",
+    "--tool-call-parser",
+    "mimo",
+    "--enable-auto-tool-choice",
+    "--generation-config",
+    "vllm",
+    "--tensor-parallel-size",
+    "64",
+    "--enable-expert-parallel",
+    "--max-model-len",
+    "1048576",
+    "--max-num-batched-tokens",
+    "8192",
+    "--max-num-seqs",
+    "4",
+    "--num-gpu-blocks-override",
+    "38587",
+    "--enable-prefix-caching",
+    "--prefix-cache-retention-interval",
+    "1024",
+    "--limit-mm-per-prompt",
+    "{\"image\": 64, \"video\": 4, \"audio\": 8}",
+    "--allowed-local-media-path",
+    "${MEDIA_DIR}"
+   ],
+   "neuron_config": {
+    "quantization": "fp8",
+    "num_batched_tokens_buckets": [
+     512,
+     1024,
+     8192
+    ],
+    "num_seqs_buckets": [
+     1,
+     4
+    ],
+    "on_device_sampling_config": {
+     "all_greedy": false
+    },
+    "mimo_attn_kernel": "nki",
+    "mimo_expert_placement": "${REPO_DIR}/config/placement3_s5.json"
+   },
+   "speculative": {
+    "default": "mtp3",
+    "options": {
+     "off": null,
+     "mtp1": {
+      "config": {
+       "method": "mtp",
+       "num_speculative_tokens": 1
+      }
+     },
+     "mtp2": {
+      "config": {
+       "method": "mtp",
+       "num_speculative_tokens": 2
+      }
+     },
+     "mtp3": {
+      "config": {
+       "method": "mtp",
+       "num_speculative_tokens": 3
+      }
+     },
+     "dflash": {
+      "config": {
+       "method": "dflash",
+       "model": "${HF_SNAPSHOT}/dflash",
+       "num_speculative_tokens": 7
+      },
+      "overrides": {
+       "args": {
+        "--num-gpu-blocks-override": 71772
+       },
+       "env": {
+        "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION": "0.31"
+       },
+       "drop_neuron_config": [
+        "mimo_expert_placement"
+       ]
+      }
+     }
+    }
+   }
+  },
+  "8k": {
+   "description": "8K context, text only, prefix caching off, up to 32 concurrent requests, NKI attention, MTP k=3 by default.",
+   "args": [
+    "--trust-remote-code",
+    "--reasoning-parser",
+    "mimo",
+    "--tool-call-parser",
+    "mimo",
+    "--enable-auto-tool-choice",
+    "--generation-config",
+    "vllm",
+    "--tensor-parallel-size",
+    "64",
+    "--enable-expert-parallel",
+    "--max-model-len",
+    "8192",
+    "--max-num-batched-tokens",
+    "4096",
+    "--max-num-seqs",
+    "32",
+    "--no-enable-prefix-caching"
+   ],
+   "neuron_config": {
+    "quantization": "fp8",
+    "num_batched_tokens_buckets": [
+     1024,
+     4096
+    ],
+    "num_seqs_buckets": [
+     1,
+     4,
+     8,
+     16,
+     32
+    ],
+    "on_device_sampling_config": {
+     "all_greedy": false,
+     "max_top_k": 256
+    },
+    "mimo_attn_kernel": "nki"
+   },
+   "speculative": {
+    "default": "mtp3",
+    "options": {
+     "off": null,
+     "mtp1": {
+      "config": {
+       "method": "mtp",
+       "num_speculative_tokens": 1
+      }
+     },
+     "mtp2": {
+      "config": {
+       "method": "mtp",
+       "num_speculative_tokens": 2
+      }
+     },
+     "mtp3": {
+      "config": {
+       "method": "mtp",
+       "num_speculative_tokens": 3
+      }
+     },
+     "dflash": {
+      "config": {
+       "method": "dflash",
+       "model": "${HF_SNAPSHOT}/dflash",
+       "num_speculative_tokens": 7
+      },
+      "overrides": {
+       "env": {
+        "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION": "0.25"
+       }
+      }
+     }
+    }
+   }
+  },
+  "8k_torch": {
+   "description": "As 8k with the torch text attention instead of the NKI kernels (fallback / comparison).",
+   "args": [
+    "--trust-remote-code",
+    "--reasoning-parser",
+    "mimo",
+    "--tool-call-parser",
+    "mimo",
+    "--enable-auto-tool-choice",
+    "--generation-config",
+    "vllm",
+    "--tensor-parallel-size",
+    "64",
+    "--enable-expert-parallel",
+    "--max-model-len",
+    "8192",
+    "--max-num-batched-tokens",
+    "4096",
+    "--max-num-seqs",
+    "32",
+    "--no-enable-prefix-caching"
+   ],
+   "neuron_config": {
+    "quantization": "fp8",
+    "num_batched_tokens_buckets": [
+     1024,
+     4096
+    ],
+    "num_seqs_buckets": [
+     1,
+     4,
+     8,
+     16,
+     32
+    ],
+    "on_device_sampling_config": {
+     "all_greedy": false,
+     "max_top_k": 256
+    }
+   },
+   "speculative": {
+    "default": "mtp3",
+    "options": {
+     "off": null,
+     "mtp1": {
+      "config": {
+       "method": "mtp",
+       "num_speculative_tokens": 1
+      }
+     },
+     "mtp2": {
+      "config": {
+       "method": "mtp",
+       "num_speculative_tokens": 2
+      }
+     },
+     "mtp3": {
+      "config": {
+       "method": "mtp",
+       "num_speculative_tokens": 3
+      }
+     },
+     "dflash": {
+      "config": {
+       "method": "dflash",
+       "model": "${HF_SNAPSHOT}/dflash",
+       "num_speculative_tokens": 7
+      },
+      "overrides": {
+       "env": {
+        "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION": "0.25"
+       }
+      }
+     }
+    }
+   }
+  }
+ },
+ "defaults_in_code": {
+  "spec_disable_by_batch_size": "17: decode steps with 17 or more scheduled requests run without draft tokens (0 = never pause)",
+  "mimo_expert_replica_min_tokens": 8192,
+  "mimo_moe_tkg_hits_max_rows": 4,
+  "mimo_moe_prefill_accumulation_dtype": "bfloat16",
+  "mimo_prompt_logprobs": true,
+  "mimo_router_dtype": "bfloat16 (unset: the checkpoint's moe_router_dtype, as vLLM on GPU)",
+  "kv_admission": "actual_blocks_reserve",
+  "mimo_fp8_linear": "block",
+  "max_logprobs": "20 (vLLM default; do not set 0: structured outputs and host-side sampling need gathered logits)"
+ },
+ "placement_sha256": "c284c134061921db05f6260d10a303292659c3cffd2087b7585a6a1bc6aea0c9"
+}
