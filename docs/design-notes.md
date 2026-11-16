@@ -119,6 +119,26 @@ on the CPU with the GPU's dtype path.
 - **Long context**: needle-in-a-haystack at 32K and 128K 20/20; 1M (999,996 tokens) correct.
 - Results of `scripts/run_bench.sh`: [results/bench_summary.md](../results/bench_summary.md).
 
+## Compared with the PyTorch/XLA deployment
+
+The same model was deployed earlier on vllm-neuron's PyTorch/XLA backend
+([mimo-v2.6-flash-vllm-neuron-pytorch-xla](https://github.com/terrificdm/mimo-v2.6-flash-vllm-neuron-pytorch-xla)).
+Main differences:
+
+| | PyTorch/XLA deployment | this repository (PyTorch native) |
+|---|---|---|
+| software | Neuron SDK 2.32, vllm-neuron 0.24, vLLM 0.24 | Neuron SDK 2.33, vllm-neuron 0.29, vLLM 0.29 |
+| model code | a separate vLLM plugin package | patches on vllm-neuron (model package and framework changes) |
+| weights | converted offline into a 350 GB FP8 directory plus a multimodal directory | the original 178 GB checkpoint, re-encoded at load time |
+| disk for weights | original 178 GB + converted 350 GB + about 3 GB | 178 GB |
+| decode graphs | one per context-length bucket (4K-1M) and batch size | one per batch size; the NKI kernel reads only the used KV |
+| first start from an empty cache | about 105 minutes | about 31 minutes |
+| running requests at 1M context | 1 | 8 (`1m`) or 4 (`1m_c4`) |
+| speculative decoding | none | MTP k=1-3 (default 3) and DFlash |
+| multimodal per request | 2 images, 1 video, 1 audio clip of at most 32 s; images downscaled to about 1024 × 1024 | 64 images, 4 videos, 8 audio clips; one item up to 114,688 tokens |
+
+Measured side by side with the same benchmark suite: [results/bench_summary.md](../results/bench_summary.md#2-native-backend-against-the-earlier-pytorchxla-deployment).
+
 ## Notes on the source tree
 
 `vllm_neuron/model/mimo_v2/README.md` inside the patched source is a development-time note (in Chinese); some status

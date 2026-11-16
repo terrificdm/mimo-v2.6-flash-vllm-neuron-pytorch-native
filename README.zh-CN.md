@@ -19,10 +19,12 @@
 - [第 4 步：发请求](#第-4-步发请求)
 - [第 5 步：冒烟测试](#第-5-步冒烟测试)
 - [第 6 步：Benchmark](#第-6-步benchmark)
+- [重启与恢复](#重启与恢复)
 - [其他配置](#其他配置)
 - [精度](#精度)
 - [限制](#限制)
 - [故障排查](#故障排查)
+- [仓库结构](#仓库结构)
 - [相关资源](#相关资源)
 - [许可证](#许可证)
 
@@ -48,6 +50,18 @@
 | GSM8K / MMLU（各 200 题，0-shot，greedy） | 98.0 % / 79.5 % |
 | 编译缓存为空时第一次启动 | 31 分钟 |
 
+GSM8K / MMLU 这一行是关闭思考的快速回归检查；其中 MMLU 只让模型回答选项字母，分数会低于模型能推理时的水平（开思考的
+MMLU-Pro 是 0.80，见[精度](#精度)）。
+
+从全新实例到第一次能发请求的实测耗时：
+
+| 步骤 | 耗时 |
+|---|---|
+| 第 1 步：检查、建 venv、安装打过补丁的 vllm-neuron | 约 8 分钟 |
+| 第 2 步：下载 178 GB 并核对 sha256 | 取决于到 Hugging Face 的带宽（没有实测） |
+| 第 3 步：第一次启动，编译全部图 | 约 31 分钟 |
+| 第 5 / 6 步：冒烟测试 / benchmark | 不到 1 分钟 / 约 12 分钟 |
+
 ## 前提条件
 
 **实例**
@@ -57,11 +71,18 @@
 - 安全组只放行入站 **SSH**。server 监听 `127.0.0.1:8000`，用 `ssh -L 8000:127.0.0.1:8000 ...` 访问。
 - 根盘至少 512 GB（DLAMI 对 Trn 实例的最低要求）；权重、venv 和编译缓存放在本地 NVMe 上（见下文）。
 
-**AMI 与软件**：Neuron SDK **2.33.0** 的 Neuron multi-framework DLAMI（Ubuntu 24.04，"Deep Learning AMI Neuron
-(Ubuntu 24.04)"；所在 Region 的 AMI ID 通过
-[Neuron multi-framework DLAMI 指南（2.33.0）](https://awsdocs-neuron.readthedocs-hosted.com/en/v2.33.0/setup/multiframework-dlami.html)
-里的 SSM 参数查询）。它自带 venv `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0`；本教程按它的包清单另建一个
-venv，不修改 DLAMI 自带的 venv。
+**AMI 与软件**：Neuron SDK **2.33.0** 的 Neuron multi-framework DLAMI（Ubuntu 24.04）。验证用的镜像名是
+`Deep Learning AMI Neuron (Ubuntu 24.04) SDK 2.33.0 20261020`，在你的 Region 里这样查它的 ID：
+
+```bash
+aws ec2 describe-images --region <region> --owners amazon \
+  --filters "Name=name,Values=Deep Learning AMI Neuron (Ubuntu 24.04) SDK 2.33.0*" \
+  --query 'sort_by(Images, &CreationDate)[-1].[ImageId, Name]' --output text
+```
+
+不要用 [DLAMI 指南](https://awsdocs-neuron.readthedocs-hosted.com/en/v2.33.0/setup/multiframework-dlami.html)里的
+`.../latest/image_id` SSM 参数：它指向最新的 Neuron SDK，`scripts/check_host.sh` 会不通过。DLAMI 自带 venv
+`/opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0`；本教程按它的包清单另建一个 venv，不修改 DLAMI 自带的 venv。
 
 > [!IMPORTANT]
 > 只在下面这些版本上验证过：
@@ -220,8 +241,26 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 # 音频：{"type": "audio_url", "audio_url": {"url": "file://'"$A"'/audio/jfk.wav"}}     -> 肯尼迪演讲
 ```
 
-工具调用（OpenAI 格式，`"tools": [...]`、`"tool_choice": "auto"`）、结构化输出（`response_format` 加 JSON schema）和
-OpenAI Python SDK 的用法与普通 vLLM server 相同。
+工具调用（OpenAI 格式，`"tools": [...]`、`"tool_choice": "auto"`）和结构化输出（`response_format` 加 JSON schema）的
+用法与普通 vLLM server 相同。
+
+从自己的电脑访问：先用 SSH 转发端口，再用任意 OpenAI 兼容客户端：
+
+```bash
+ssh -i <your SSH key file> -N -L 8000:127.0.0.1:8000 ubuntu@<实例公网 DNS 或 IP>     # 保持这个窗口不关
+```
+
+```python
+# pip install openai
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="EMPTY")   # server 不校验 key
+r = client.chat.completions.create(
+    model="mimo-v2.6-flash", max_tokens=2048, temperature=1.0, top_p=0.95,
+    messages=[{"role": "user", "content": "用三句话介绍一下长城。"}])
+print(getattr(r.choices[0].message, "reasoning", None))   # 思考（vLLM 额外返回的字段）
+print(r.choices[0].message.content)                      # 回答
+```
 
 [scripts/api_tests/ask.py](scripts/api_tests/ask.py) 是一个小的流式客户端，把本地文件转成 base64 发送（只用标准库）：
 
@@ -246,7 +285,7 @@ bash scripts/smoke_test.sh       # 8k profile 上用：bash scripts/smoke_test.s
 ## 第 6 步：Benchmark
 
 ```bash
-OUT=/mnt/nvme/mimo/bench/1m-mtp3 bash scripts/run_bench.sh       # 约 15 分钟；SMOKE=1 跑缩小版
+OUT=/mnt/nvme/mimo/bench/1m-mtp3 bash scripts/run_bench.sh       # 约 12 分钟；SMOKE=1 跑缩小版
 ```
 
 [scripts/run_bench.sh](scripts/run_bench.sh) 只通过 HTTP 测试：`vllm bench serve` 随机 prompt（512 / 8K / 32K / 128K
@@ -279,6 +318,22 @@ GSM8K 98.0 %、MMLU 79.5 %（各 200 题）。每个逻辑核的 HBM：就绪时
   1.4–2.0 倍（[speculative-decoding.md](docs/speculative-decoding.md#2-how-much-it-helps)）。
 - 一个请求可以占满整个 1M KV 池；同时有多个长请求时，后面的要排队。
 
+## 重启与恢复
+
+| 情况 | 还剩什么 | 怎么做 |
+|---|---|---|
+| server 停了（Ctrl-C、`scripts/stop.sh`）或崩溃 | 全部都在 | 再执行 `bash scripts/serve.sh`；从缓存启动约 13 分钟 |
+| 实例重启（reboot） | NVMe RAID 上的数据还在，但 RAID 没有挂载 | `sudo mdadm --assemble --scan && sudo mount -o noatime /dev/md0 /mnt/nvme`，再 `bash scripts/serve.sh`（约 13 分钟） |
+| 实例停止再启动，或换了实例（例如 Capacity Block 到期） | 什么都没有：实例存储被清空 | 重新组 RAID，重做第 1–3 步，包括下载和约 31 分钟的首次编译 |
+| 换 profile 或投机选项 | 其他配置的缓存都在 | `bash scripts/stop.sh`，再 `bash scripts/serve.sh --profile ... --spec ...`；新组合第一次启动要编译自己的图 |
+
+想在新实例上省掉下载：事先把 `$MIMO_ROOT/hf` 拷到持久存储（EBS 或 S3），第 2 步之前拷回来，`scripts/download_weights.sh`
+就只做校验。把编译缓存搬到另一台实例上复用没有测试过。
+
+磁盘：`$MIMO_ROOT/cache/<tree>/<profile>-<spec>` 属于单个配置（删掉后该配置下次启动会重建它的 torch.compile 缓存）；
+`$MIMO_ROOT/cache/<tree>/shared` 存放所有配置的编译图；代码改动后，旧 `<tree>` 下的目录就不再使用。`$MIMO_ROOT/logs`、
+`results`、`bench` 随时可删；`$MIMO_ROOT/tmp` 在没有 server 运行时可删。
+
 ## 其他配置
 
 [config/serve_args.json](config/serve_args.json) 有 4 个 profile 和 5 个投机选项：
@@ -302,7 +357,8 @@ bash scripts/serve.sh --profile 8k                  # --spec off | mtp1 | mtp2 |
 
 - **Logits**：对真 FP32 参考（16 条 prompt × 64 步），与同一权重下 GPU 算法的 CPU 仿真相比，4 个默认配置的 p95 误差比
   0.84–0.94、σ 比 1.00–1.04（小于 1 表示比仿真的 GPU 更接近 FP32）。
-- **GSM8K / MMLU-Pro**（1,319 / 1,000 题）：FP8 与 BF16 权重的差在 1 个配对标准误以内（GSM8K greedy 都是 0.9712）。
+- **GSM8K / MMLU-Pro**（1,319 / 1,000 题，开思考）：FP8 与 BF16 权重的差在 1 个配对标准误以内（GSM8K greedy 都是
+  0.9712）。MMLU-Pro 用 GPU 对齐采样、`max_tokens` 8192 跑两次：0.797 和 0.804。
 - **音频**：关投机时 LibriSpeech test-clean 1,551 词的词错率 2.19–2.26 %。
 - `scripts/run_bench.sh`：GSM8K 98.0 %，MMLU 79.5 %（各 200 题）。
 
@@ -332,13 +388,30 @@ bash scripts/serve.sh --profile 8k                  # --spec off | mtp1 | mtp2 |
 - **只有思考、没有回答**：调大 `max_tokens` 或关闭思考。
 - **重启后 `/mnt/nvme` 是空的**：重新组装 RAID（实例停止再启动后数据已经没了）。
 
+## 仓库结构
+
+| 路径 | 内容 |
+|---|---|
+| [patches/vllm-neuron/](patches/vllm-neuron/) | 模型支持：打在 vllm-neuron `release-0.29.0.1.2.0` 上的 3 个补丁 |
+| [sources.lock.json](sources.lock.json) | 锁定的基线 commit、补丁 sha256、期望的树哈希 |
+| [requirements/](requirements/) | 服务 venv 的包清单（照搬 DLAMI vLLM venv）和音频解码包 |
+| [weights.lock.json](weights.lock.json) | 锁定 checkpoint 的 154 个文件及其大小和 sha256 |
+| [config/](config/) | `serve_args.json`（全部 profile 和投机选项）、`placement3_s5.json`（专家放置表） |
+| [scripts/](scripts/) | 安装、启动 / 停止、冒烟测试和 benchmark；`scripts/api_tests/` 是 HTTP 客户端，`scripts/dev/` 是发布前检查 |
+| [assets/](assets/)、[data/task_eval/](data/task_eval/) | 测试素材和标准答案；benchmark 用的 GSM8K / MMLU 题目 |
+| [docs/](docs/) | 配置、投机解码、设计说明、限制、故障排查、开发、发布前检查 |
+| [results/](results/) | benchmark 和精度的实测结果 |
+
+每个文件的说明见 [docs/development.md](docs/development.md#repository-layout)。
+
 ## 相关资源
 
 - [Hugging Face 上的 XiaomiMiMo/MiMo-V2.6-Flash-MOPD](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD)
 - [vllm-project/vllm-neuron](https://github.com/vllm-project/vllm-neuron)
 - [Neuron multi-framework DLAMI（2.33.0）](https://awsdocs-neuron.readthedocs-hosted.com/en/v2.33.0/setup/multiframework-dlami.html)
 - [mimo-v2.6-flash-vllm-neuron-pytorch-xla](https://github.com/terrificdm/mimo-v2.6-flash-vllm-neuron-pytorch-xla)：
-  同一模型在 vllm-neuron PyTorch/XLA 后端（Neuron SDK 2.32）上的部署
+  同一模型在 vllm-neuron PyTorch/XLA 后端（Neuron SDK 2.32）上的部署；两者的差别见
+  [设计说明](docs/design-notes.md#compared-with-the-pytorchxla-deployment)
 - 本仓库：[配置](docs/configuration.md)、[投机解码](docs/speculative-decoding.md)、[设计说明](docs/design-notes.md)、
   [限制](docs/limitations.md)、[故障排查](docs/troubleshooting.md)、[开发](docs/development.md)、
   [结果](results/README.md)、[发布前检查](docs/release-checklist.md)。

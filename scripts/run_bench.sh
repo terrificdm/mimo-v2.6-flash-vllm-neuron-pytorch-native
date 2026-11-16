@@ -28,7 +28,7 @@
 # of the 128K prompt #0), which the prefix cache would hit. Distinct seeds were checked: no shared prefix.
 #
 # Usage (on the instance):
-#   OUT=$MIMO_ROOT/bench/<name> bash scripts/run_bench.sh                     # all items, about 15-25 min
+#   OUT=$MIMO_ROOT/bench/<name> bash scripts/run_bench.sh                     # all items, about 12 min on 1m
 #   ITEMS="1 2" OUT=... bash scripts/run_bench.sh                             # subset
 #   SMOKE=1 OUT=/tmp/smoke bash scripts/run_bench.sh                          # tiny version of every item
 # Env (defaults from scripts/env.sh): BASE_URL (http://127.0.0.1:8000), SERVED_MODEL (mimo-v2.6-flash), MODEL_DIR

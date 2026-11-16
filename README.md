@@ -21,10 +21,12 @@ send requests → benchmark.
 - [Step 4. Send requests](#step-4-send-requests)
 - [Step 5. Smoke test](#step-5-smoke-test)
 - [Step 6. Benchmark](#step-6-benchmark)
+- [Restarting and recovery](#restarting-and-recovery)
 - [Other configurations](#other-configurations)
 - [Accuracy](#accuracy)
 - [Limitations](#limitations)
 - [Troubleshooting](#troubleshooting)
+- [Repository layout](#repository-layout)
 - [Related resources](#related-resources)
 - [License](#license)
 
@@ -51,6 +53,19 @@ Key numbers (one trn2.48xlarge, `1m` profile with MTP k=3, `scripts/run_bench.sh
 | GSM8K / MMLU (200 questions each, 0-shot, greedy) | 98.0 % / 79.5 % |
 | First start from an empty compile cache | 31 minutes |
 
+The GSM8K / MMLU row is a quick regression check with thinking off; MMLU there asks for the answer letter only, which
+keeps the score below what the model reaches when it can reason (MMLU-Pro with thinking on: 0.80, see
+[Accuracy](#accuracy)).
+
+Time from a fresh instance to the first request, as measured:
+
+| Step | Time |
+|---|---|
+| Step 1: check, venv, patched vllm-neuron | about 8 minutes |
+| Step 2: download 178 GB and check sha256 | depends on the bandwidth to Hugging Face (not measured) |
+| Step 3: first start, compiling every graph | about 31 minutes |
+| Step 5 / 6: smoke test / benchmark | under 1 minute / about 12 minutes |
+
 ## Prerequisites
 
 **Instance**
@@ -62,11 +77,20 @@ Key numbers (one trn2.48xlarge, `1m` profile with MTP k=3, `scripts/run_bench.sh
 - A root volume of at least 512 GB (the DLAMI's minimum for Trn instances); the weights, venv and compile cache go on
   the local NVMe drives (below).
 
-**AMI and software**: the Neuron multi-framework DLAMI for **Neuron SDK 2.33.0** on Ubuntu 24.04
-("Deep Learning AMI Neuron (Ubuntu 24.04)"; find the AMI ID of your Region through the SSM parameters in the
-[Neuron multi-framework DLAMI guide (2.33.0)](https://awsdocs-neuron.readthedocs-hosted.com/en/v2.33.0/setup/multiframework-dlami.html)).
-It ships the venv `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0`, whose package list this tutorial
-copies into a separate venv; the DLAMI venv itself is not modified.
+**AMI and software**: the Neuron multi-framework DLAMI for **Neuron SDK 2.33.0** on Ubuntu 24.04. The validated
+image is named `Deep Learning AMI Neuron (Ubuntu 24.04) SDK 2.33.0 20261020`; find its ID in your Region with:
+
+```bash
+aws ec2 describe-images --region <region> --owners amazon \
+  --filters "Name=name,Values=Deep Learning AMI Neuron (Ubuntu 24.04) SDK 2.33.0*" \
+  --query 'sort_by(Images, &CreationDate)[-1].[ImageId, Name]' --output text
+```
+
+Do not use the `.../latest/image_id` SSM parameter of the
+[DLAMI guide](https://awsdocs-neuron.readthedocs-hosted.com/en/v2.33.0/setup/multiframework-dlami.html): it points to
+the newest Neuron SDK, on which `scripts/check_host.sh` fails. The DLAMI ships the venv
+`/opt/aws_neuronx_venv_pytorch_inference_vllm_0_29_0_1_2_0`, whose package list this tutorial copies into a separate
+venv; the DLAMI venv itself is not modified.
 
 > [!IMPORTANT]
 > Validated only on these versions:
@@ -230,8 +254,26 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 # audio: {"type": "audio_url", "audio_url": {"url": "file://'"$A"'/audio/jfk.wav"}}     -> JFK quote
 ```
 
-Tool calling (OpenAI format, `"tools": [...]`, `"tool_choice": "auto"`), structured outputs (`response_format` with
-a JSON schema) and the OpenAI Python SDK work as with any vLLM server.
+Tool calling (OpenAI format, `"tools": [...]`, `"tool_choice": "auto"`) and structured outputs (`response_format`
+with a JSON schema) work as with any vLLM server.
+
+From your own computer, forward the port over SSH and use any OpenAI-compatible client:
+
+```bash
+ssh -i <your SSH key file> -N -L 8000:127.0.0.1:8000 ubuntu@<instance public DNS or IP>     # keep it open
+```
+
+```python
+# pip install openai
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="EMPTY")   # the server checks no key
+r = client.chat.completions.create(
+    model="mimo-v2.6-flash", max_tokens=2048, temperature=1.0, top_p=0.95,
+    messages=[{"role": "user", "content": "Introduce the Great Wall in three sentences."}])
+print(getattr(r.choices[0].message, "reasoning", None))   # thinking (vLLM's extra field)
+print(r.choices[0].message.content)                      # answer
+```
 
 [scripts/api_tests/ask.py](scripts/api_tests/ask.py) is a small streaming client that sends local files as base64
 (standard library only):
@@ -259,7 +301,7 @@ schema, 4 concurrent requests, image, video and audio. Expected: `smoke: 13 pass
 ## Step 6. Benchmark
 
 ```bash
-OUT=/mnt/nvme/mimo/bench/1m-mtp3 bash scripts/run_bench.sh       # about 15 minutes; SMOKE=1 for a tiny version
+OUT=/mnt/nvme/mimo/bench/1m-mtp3 bash scripts/run_bench.sh       # about 12 minutes; SMOKE=1 for a tiny version
 ```
 
 [scripts/run_bench.sh](scripts/run_bench.sh) runs, over HTTP only: `vllm bench serve` with random prompts (512 / 8K /
@@ -295,6 +337,24 @@ Notes:
   ([speculative-decoding.md](docs/speculative-decoding.md#2-how-much-it-helps)).
 - One request can use the whole 1M KV pool; with several long requests, later ones wait.
 
+## Restarting and recovery
+
+| Situation | What is left | What to do |
+|---|---|---|
+| server stopped (Ctrl-C, `scripts/stop.sh`) or crashed | everything | `bash scripts/serve.sh` again; ready in about 13 minutes from the cache |
+| instance rebooted | data on the NVMe RAID, but the RAID is not mounted | `sudo mdadm --assemble --scan && sudo mount -o noatime /dev/md0 /mnt/nvme`, then `bash scripts/serve.sh` (about 13 minutes) |
+| instance stopped and started, or replaced (for example at the end of a Capacity Block) | nothing: instance storage is erased | repeat the RAID setup and Steps 1-3, including the download and the 31-minute first compile |
+| another profile or speculative option | the other configurations' caches | `bash scripts/stop.sh`, then `bash scripts/serve.sh --profile ... --spec ...`; the first start of a new combination compiles its graphs |
+
+To skip the download on a new instance, copy `$MIMO_ROOT/hf` to durable storage (EBS or S3) beforehand and put it
+back before Step 2; `scripts/download_weights.sh` then only checks it. Reusing a compile cache on another instance
+has not been tested.
+
+Disk: `$MIMO_ROOT/cache/<tree>/<profile>-<spec>` belongs to one configuration (deleting it makes that configuration
+rebuild its torch.compile cache on its next start); `$MIMO_ROOT/cache/<tree>/shared` holds the compiled graphs of all configurations;
+directories of an older `<tree>` are unused after the code changed. `$MIMO_ROOT/logs`, `results` and `bench` can be
+deleted at any time; `$MIMO_ROOT/tmp` while no server runs.
+
 ## Other configurations
 
 [config/serve_args.json](config/serve_args.json) has four profiles and five speculative options:
@@ -319,8 +379,9 @@ Details: [docs/configuration.md](docs/configuration.md), [docs/speculative-decod
 - **Logits** against a true FP32 reference (16 prompts × 64 steps), relative to a CPU emulation of the GPU algorithm
   with the same weights: p95 error ratio 0.84-0.94 and σ ratio 1.00-1.04 for all four default configurations (below 1
   = closer to FP32 than the emulated GPU).
-- **GSM8K / MMLU-Pro** (1,319 / 1,000 questions): FP8 equals BF16 weights within one paired standard error
-  (GSM8K greedy 0.9712 both).
+- **GSM8K / MMLU-Pro** (1,319 / 1,000 questions, thinking on): FP8 equals BF16 weights within one paired standard
+  error (GSM8K greedy 0.9712 both). MMLU-Pro with GPU-aligned sampling and `max_tokens` 8192: 0.797 and 0.804 in two
+  runs.
 - **Audio**: word error rate 2.19-2.26 % on 1,551 LibriSpeech test-clean words without speculation.
 - `scripts/run_bench.sh`: GSM8K 98.0 %, MMLU 79.5 % (200 questions each).
 
@@ -350,13 +411,30 @@ More cases: [docs/troubleshooting.md](docs/troubleshooting.md).
 - **Only reasoning, no answer**: raise `max_tokens` or turn thinking off.
 - **`/mnt/nvme` empty after reboot**: re-assemble the RAID (after stop / start the data is gone).
 
+## Repository layout
+
+| Path | Content |
+|---|---|
+| [patches/vllm-neuron/](patches/vllm-neuron/) | the model support: 3 patches on vllm-neuron `release-0.29.0.1.2.0` |
+| [sources.lock.json](sources.lock.json) | pinned base commit, patch sha256 values, expected tree hashes |
+| [requirements/](requirements/) | package list of the serving venv (copied from the DLAMI vLLM venv) and the audio decoders |
+| [weights.lock.json](weights.lock.json) | the pinned checkpoint's 154 files with size and sha256 |
+| [config/](config/) | `serve_args.json` (all profiles and speculative options), `placement3_s5.json` (expert placement) |
+| [scripts/](scripts/) | setup, serve / stop, smoke test and benchmark; `scripts/api_tests/` HTTP clients; `scripts/dev/` release checks |
+| [assets/](assets/), [data/task_eval/](data/task_eval/) | test media with expected answers; GSM8K / MMLU questions for the benchmark |
+| [docs/](docs/) | configuration, speculative decoding, design notes, limitations, troubleshooting, development, release checklist |
+| [results/](results/) | measured benchmark and accuracy results |
+
+Every file is described in [docs/development.md](docs/development.md#repository-layout).
+
 ## Related resources
 
 - [XiaomiMiMo/MiMo-V2.6-Flash-MOPD on Hugging Face](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD)
 - [vllm-project/vllm-neuron](https://github.com/vllm-project/vllm-neuron)
 - [Neuron multi-framework DLAMI (2.33.0)](https://awsdocs-neuron.readthedocs-hosted.com/en/v2.33.0/setup/multiframework-dlami.html)
 - [mimo-v2.6-flash-vllm-neuron-pytorch-xla](https://github.com/terrificdm/mimo-v2.6-flash-vllm-neuron-pytorch-xla):
-  the same model on the vllm-neuron PyTorch/XLA backend (Neuron SDK 2.32)
+  the same model on the vllm-neuron PyTorch/XLA backend (Neuron SDK 2.32); differences:
+  [design notes](docs/design-notes.md#compared-with-the-pytorchxla-deployment)
 - In this repository: [configuration](docs/configuration.md), [speculative decoding](docs/speculative-decoding.md),
   [design notes](docs/design-notes.md), [limitations](docs/limitations.md),
   [troubleshooting](docs/troubleshooting.md), [development](docs/development.md), [results](results/README.md),

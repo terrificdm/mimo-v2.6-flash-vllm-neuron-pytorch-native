@@ -2,23 +2,53 @@
 
 ## Repository layout
 
-```
-README.md, README.zh-CN.md   tutorial (English / Chinese)
-LICENSE, NOTICE              Apache-2.0; third-party sources
-sources.lock.json            vllm-neuron base commit, patch sha256 values, expected tree hashes
-patches/vllm-neuron/         the model code, as patches on vllm-neuron release-0.29.0.1.2.0
-requirements/                serve-freeze.txt (the DLAMI vLLM venv's package set), audio.txt (av, soundfile)
-weights.lock.json            the pinned checkpoint's files: size and sha256
-config/serve_args.json       all serving profiles and speculative options
-config/placement3_s5.json    expert placement table of the 1M profiles
-scripts/                     setup, serve / stop, smoke test, benchmark (see docs/configuration.md, section 8)
-scripts/api_tests/           HTTP clients used by the smoke test and the benchmark (standard library only)
-scripts/dev/                 repository checks run before a release
-assets/                      test media (image, video, audio) with expected answers and SHA256SUMS
-data/task_eval/              GSM8K and MMLU subsets (200 questions each) for scripts/run_bench.sh
-docs/                        configuration, speculative decoding, design notes, limitations, troubleshooting
-results/                     measured results
-```
+Top level:
+
+| File | Content |
+|---|---|
+| `README.md`, `README.zh-CN.md` | the tutorial (English / Chinese) |
+| `LICENSE`, `NOTICE` | Apache-2.0; third-party sources and what was copied or adapted |
+| `sources.lock.json` | vllm-neuron repository, base commit, sha256 of each patch, expected tree and `vllm_neuron/` subtree hashes |
+| `weights.lock.json` | Hugging Face repository, revision, and path / size / sha256 of each of the 154 checkpoint files |
+| `.gitignore`, `.gitattributes` | keeps weights, caches and logs out of Git; keeps the patches byte-exact |
+
+| Directory | File | Content |
+|---|---|---|
+| `patches/vllm-neuron/` | `0001-...`, `0002-...`, `0003-...` | the model support as patches on vllm-neuron `release-0.29.0.1.2.0` ([Patches](#patches)) |
+| `requirements/` | `serve-freeze.txt` | the DLAMI vLLM venv's 370 packages with exact versions (installed with `--no-deps`) |
+| | `audio.txt` | `av` and `soundfile` for audio decoding |
+| `config/` | `serve_args.json` | environment, profiles (`1m`, `1m_c4`, `8k`, `8k_torch`), speculative options, `placement_sha256` ([configuration.md](configuration.md)) |
+| | `placement3_s5.json` | expert placement of the 1M profiles: 64 ranks × 5 slots for each of the 47 MoE layers |
+| `scripts/` | `env.sh` | paths and environment shared by all scripts (`MIMO_ROOT` and the directories under it) |
+| | `check_host.sh` | read-only host checks |
+| | `setup_venv.sh` | creates the serving venv |
+| | `setup_source.sh` | clones vllm-neuron, applies and checks the patches, editable install |
+| | `download_weights.sh`, `verify_weights.py` | downloads the checkpoint; checks it against `weights.lock.json` |
+| | `render_serve_args.py` | turns a profile and option of `serve_args.json` into the environment and the `vllm serve` command |
+| | `serve.sh`, `wait_ready.sh`, `stop.sh` | starts the server in the foreground, waits for it, stops it |
+| | `smoke_test.sh` | runs `api_tests/smoke.py` |
+| | `run_bench.sh` | the benchmark suite (`vllm bench serve`, needle / prefix cache, media, GSM8K / MMLU) |
+| `scripts/api_tests/` | `common.py` | HTTP helpers and the result writer shared by the clients (standard library only) |
+| | `smoke.py` | the 13 smoke checks |
+| | `ask.py` | streaming client for text / image / video / audio questions |
+| | `needle.py`, `prefix_cache_test.py` | builds needle prompts; sends a prompt cold, repeated and with a follow-up turn |
+| | `task_eval.py` | GSM8K / MMLU on the questions in `data/task_eval/` |
+| `scripts/dev/` | `check_independence.sh`, `check_doc_paths.py`, `scan_sensitive.sh` | release checks ([release-checklist.md](release-checklist.md)) |
+| `assets/` | images, `digits_1234.mp4`, `audio/*.wav`, `answers.json`, `SHA256SUMS` | test media and their expected answers |
+| `data/task_eval/` | `gsm8k_test_200_seed0.jsonl`, `mmlu_test_200_seed0.jsonl`, `task_eval_item_ids.json` | 200 questions each and their ids in the official test splits |
+| `docs/` | `configuration.md` | profiles, speculative options, expert placement, multimodal limits, compile cache, environment, scripts |
+| | `speculative-decoding.md` | which option to choose, measured gains, limits, memory |
+| | `design-notes.md` | how the port works, accuracy, comparison with the PyTorch/XLA deployment |
+| | `limitations.md`, `troubleshooting.md` | known limits; symptoms and fixes |
+| | `development.md` | this file |
+| | `release-checklist.md` | checks before a release |
+| `results/` | `bench_summary.md`, `accuracy_summary.md`, `README.md` | measured results and how they were obtained |
+| `results/bench/` | `<profile>-<option>.summary.json` | summaries of `scripts/run_bench.sh` runs |
+
+Created on the instance, not in the repository (`MIMO_ROOT` defaults to `/mnt/nvme/mimo`): `$MIMO_ROOT/venv`,
+`$MIMO_ROOT/src/vllm-neuron`, `$MIMO_ROOT/hf` (checkpoint), `$MIMO_ROOT/cache` (compile caches),
+`$MIMO_ROOT/neuron-compile-cache`, `$MIMO_ROOT/logs`, `$MIMO_ROOT/run`, `$MIMO_ROOT/tmp`, `$MIMO_ROOT/results`,
+`$MIMO_ROOT/bench`.
 
 ## Patches
 
