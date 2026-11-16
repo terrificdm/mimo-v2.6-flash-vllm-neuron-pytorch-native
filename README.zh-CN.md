@@ -78,8 +78,8 @@ venv，不修改 DLAMI 自带的 venv。
 >
 > 不要在服务 venv 里升级或添加包。
 
-**磁盘**：权重 178 GB + 服务 venv 约 13 GB + 每个启动过的配置约 25 GB 编译缓存（`1m` 和 `8k` 的所有投机选项都启动过约
-150–200 GB）。把 4 块实例存储 NVMe 组成 RAID 0（约 6.9 TiB；先用 `lsblk` 确认设备名）：
+**磁盘**：权重 178 GB + 服务 venv 约 13 GB + 每个启动过的配置各自的编译缓存（`1m` 加 MTP k=3 是 15 GB，其他配置 8–25 GB；
+`1m` 和 `8k` 的所有投机选项都启动过约 150–200 GB）。把 4 块实例存储 NVMe 组成 RAID 0（约 6.9 TiB；先用 `lsblk` 确认设备名）：
 
 ```bash
 sudo mdadm --create /dev/md0 --level=0 --raid-devices=4 /dev/nvme1n1 /dev/nvme2n1 /dev/nvme3n1 /dev/nvme4n1
@@ -146,8 +146,8 @@ bash scripts/serve.sh            # profile 1m，MTP k=3
 bash scripts/wait_ready.sh       # 每 5 分钟打印一次最新日志；最后是 "ready ... ['mimo-v2.6-flash']"
 ```
 
-**耗时**：编译缓存为空时，第一次启动约 **31 分钟**：约 10 分钟把权重加载到 64 个核上，然后并行编译各个图
-（每个 prefill 档位、每个 decode 档位一个，外加编码器和草稿层）。之后同一配置的启动从缓存加载，约 14 分钟。日志是
+**耗时**：编译缓存为空时，第一次启动约 **31 分钟**：7–10 分钟把权重加载到 64 个核上，然后并行编译各个图
+（每个 prefill 档位、每个 decode 档位一个，外加编码器和草稿层）。之后同一配置的启动从缓存加载，约 13 分钟。日志是
 `/mnt/nvme/mimo/logs/serve-latest.log`，里面有 `Using neuron_native backend`。
 
 `scripts/serve.sh` 从 [config/serve_args.json](config/serve_args.json) 渲染出命令，`--dry-run` 只打印不启动。`1m`
@@ -267,7 +267,7 @@ token，并发 1 和 4）、needle 长 prompt（30K 和 940K token：第一次�
 | 940K needle prompt：第一次 / 重复 / 追问 | 148.8 / 3.38 / 3.20 s | — | — |
 | 图片 / 视频 / 音频（TTFT，3 次中位数） | 0.22 / 0.33 / 0.22 s | — | — |
 
-GSM8K 98.0 %、MMLU 79.5 %（各 200 题）。每个逻辑核的 HBM：就绪时 20.96 GiB，940K prompt 之后最多 21.67 GiB（上限
+GSM8K 98.0 %、MMLU 79.5 %（各 200 题）。每个逻辑核的 HBM：就绪时 20.96 GiB，940K prompt 之后最忙的核 21.67 GiB（上限
 24 GiB）。编译缓存为空时第一次启动：1,877 s。
 
 同一套测试也在这个模型之前的 PyTorch/XLA 后端部署（Neuron SDK 2.32、vllm-neuron 0.24）上跑过；对比和 1M 4 并发配置的
@@ -300,8 +300,8 @@ bash scripts/serve.sh --profile 8k                  # --spec off | mtp1 | mtp2 |
 
 ## 精度
 
-- **Logits**：对真 FP32 参考（16 条 prompt × 64 步），4 个默认配置的误差都在 GPU 算法 CPU 仿真的误差以内（p95 比
-  0.84–0.94，σ 比 1.00–1.04）。
+- **Logits**：对真 FP32 参考（16 条 prompt × 64 步），与同一权重下 GPU 算法的 CPU 仿真相比，4 个默认配置的 p95 误差比
+  0.84–0.94、σ 比 1.00–1.04（小于 1 表示比仿真的 GPU 更接近 FP32）。
 - **GSM8K / MMLU-Pro**（1,319 / 1,000 题）：FP8 与 BF16 权重的差在 1 个配对标准误以内（GSM8K greedy 都是 0.9712）。
 - **音频**：关投机时 LibriSpeech test-clean 1,551 词的词错率 2.19–2.26 %。
 - `scripts/run_bench.sh`：GSM8K 98.0 %，MMLU 79.5 %（各 200 题）。

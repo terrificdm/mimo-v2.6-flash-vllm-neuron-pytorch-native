@@ -61,10 +61,11 @@ logf=$LOG_DIR/serve-$profile-$spec-$(date -u +%Y%m%dT%H%M%SZ).log
 ln -sfn "$logf" "$LOG_DIR/serve-latest.log"
 echo "$$" > "$RUN_DIR/serve.pid"
 log "log: $logf (also $LOG_DIR/serve-latest.log)"
-log "ready when: curl -sf http://127.0.0.1:$port/v1/models (first start from an empty cache: about 30-40 min)"
+log "ready when: curl -sf http://127.0.0.1:$port/v1/models (first start from an empty cache: about 25-35 min)"
 export HF_HUB_OFFLINE=1
 for e in "${ENVV[@]}"; do export "${e?}"; done
 # vllm-neuron logs its backend only when get_backend() is called; print it once so the log shows the route.
 "$VENV/bin/python" -c "from vllm_neuron.backend import get_backend; print('vllm-neuron backend:', get_backend())" 2>&1 | tee -a "$logf"
-exec > >(tee -a "$logf") 2>&1
+# tee ignores Ctrl-C / SIGTERM so that it keeps logging while vllm serve shuts down its workers.
+exec > >(trap '' INT TERM; exec tee -a "$logf") 2>&1
 exec "$VENV/bin/vllm" "${ARGV[@]:1}"

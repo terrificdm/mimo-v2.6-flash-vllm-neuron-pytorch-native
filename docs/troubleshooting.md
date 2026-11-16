@@ -10,7 +10,7 @@ The server log is `$MIMO_ROOT/logs/serve-latest.log` (a link to the log of the l
 | `setup_venv.sh`: `venv differs from requirements/serve-freeze.txt` | something was installed into `$VENV` by hand; remove `$VENV` and run the script again |
 | `setup_source.sh`: `patch files do not match sources.lock.json` | the patch files changed (for example by a Git setting that rewrites line endings); clone the repository again |
 | `setup_source.sh`: `exists but its tree is ...` | `$SRC_DIR/vllm-neuron` is from another version; move it away and run again |
-| `setup_source.sh`: `git am failed` | the clone is not at the pinned base commit; move `$SRC_DIR/vllm-neuron` away and run again |
+| `setup_source.sh`: `git am failed` | the upstream base commit is not reachable or the checkout is damaged; move `$SRC_DIR/vllm-neuron` away and run again (the patch hashes were already checked) |
 | `download_weights.sh` exits 3 during the download | network interruption; run it again (it resumes) |
 | `download_weights.sh`: `sha256 ... !=` | a damaged file; delete that file's blob under `$HF_HOME/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/blobs/` and run again |
 

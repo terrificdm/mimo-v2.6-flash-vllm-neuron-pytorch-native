@@ -7,8 +7,8 @@
   vllm-neuron PyTorch native backend. Other versions are not tested.
 - The deployment uses the whole instance: tensor parallel 64 with expert parallel 64 over the 64 logical
   NeuronCores. One server per instance.
-- The first start compiles for about 25-35 minutes and needs about 1.9 TB of host memory (64 ranks trace at the same
-  time). Weights and compile cache live on the instance-store NVMe and are lost when the instance stops.
+- The first start compiles for about 25-35 minutes and uses a large part of the 2 TB host memory (64 ranks trace at
+  the same time; `scripts/check_host.sh` requires at least 1,900 GiB). Weights and compile cache live on the instance-store NVMe and are lost when the instance stops.
 
 ## Requests
 
@@ -51,11 +51,11 @@
 
 - FP8 linear layers are numerically FP8 × FP8 (the GPU algorithm), but the matrix multiplication runs at BF16 rate:
   trn2 has no kernel for 128 × 128 block-scaled FP8.
-- The MoE cross-expert accumulation is BF16 (FP32 on GPU). Measured against FP32 references the logit error stays
-  within the same bounds as a CPU emulation of the GPU algorithm ([design-notes.md](design-notes.md#accuracy)).
+- The MoE cross-expert accumulation is BF16 (FP32 on GPU). Measured against an FP32 reference, the logit error is close to
+  that of a CPU emulation of the GPU algorithm (p95 ratio 0.84-0.94, σ ratio 1.00-1.04) ([design-notes.md](design-notes.md#accuracy)).
 
 ## Performance
 
 - Prefix-cache hits on 1M-token prompts spend most of their time in host-side preprocessing of the 1M-token text.
 - On the 1M profiles the expert placement table is fitted on natural text; prefix-hit and short-request traffic is
-  0-3 % slower with it ([configuration.md](configuration.md#3-expert-placement-configplacement3_s5json)).
+  0-4 % slower with it ([configuration.md](configuration.md#3-expert-placement-configplacement3_s5json)).

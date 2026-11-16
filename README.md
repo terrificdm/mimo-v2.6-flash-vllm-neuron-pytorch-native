@@ -83,8 +83,8 @@ copies into a separate venv; the DLAMI venv itself is not modified.
 >
 > Do not upgrade or add packages in the serving venv.
 
-**Disk**: weights 178 GB + serving venv about 13 GB + compile cache about 25 GB per configuration started (about
-150-200 GB if you start every option of `1m` and `8k`). Use the four instance-store NVMe drives in RAID 0 (about
+**Disk**: weights 178 GB + serving venv about 13 GB + compile cache for each configuration you start (15 GB for `1m`
+with MTP k=3, 8-25 GB for the others; about 150-200 GB if you start every option of `1m` and `8k`). Use the four instance-store NVMe drives in RAID 0 (about
 6.9 TiB; check the device names with `lsblk`):
 
 ```bash
@@ -154,9 +154,9 @@ In another shell, wait until it is ready:
 bash scripts/wait_ready.sh       # prints the last log line every 5 minutes; ends with "ready ... ['mimo-v2.6-flash']"
 ```
 
-**Time**: the first start from an empty compile cache takes about **31 minutes**: about 10 minutes to
+**Time**: the first start from an empty compile cache takes about **31 minutes**: 7-10 minutes to
 load the weights onto 64 cores, then the graphs compile in parallel (one per prefill bucket and decode bucket, plus
-the encoders and the draft layer). Later starts of the same configuration load from the cache and take about 14
+the encoders and the draft layer). Later starts of the same configuration load from the cache and take about 13
 minutes. The log is `/mnt/nvme/mimo/logs/serve-latest.log`; it shows `Using neuron_native backend`.
 
 `scripts/serve.sh` renders the command from [config/serve_args.json](config/serve_args.json); `--dry-run` prints it.
@@ -281,8 +281,8 @@ Results of the recommended configuration (`1m`, MTP k=3):
 | 940K needle prompt: first / repeat / follow-up | 148.8 / 3.38 / 3.20 s | — | — |
 | image / video / audio (TTFT, median of 3) | 0.22 / 0.33 / 0.22 s | — | — |
 
-GSM8K 98.0 %, MMLU 79.5 % (200 questions each). HBM per logical core: 20.96 GiB at ready, 21.67 GiB at most after
-the 940K prompt (limit 24 GiB). First start from an empty compile cache: 1,877 s.
+GSM8K 98.0 %, MMLU 79.5 % (200 questions each). HBM per logical core: 20.96 GiB at ready, 21.67 GiB on the busiest
+core after the 940K prompt (limit 24 GiB). First start from an empty compile cache: 1,877 s.
 
 The same suite was run on the earlier deployment of this model with the PyTorch/XLA backend (Neuron SDK 2.32,
 vllm-neuron 0.24); the comparison and the 1M configuration with 4 sequences are in
@@ -316,8 +316,9 @@ Details: [docs/configuration.md](docs/configuration.md), [docs/speculative-decod
 
 ## Accuracy
 
-- **Logits** against a true FP32 reference (16 prompts × 64 steps): the error of all four default configurations is
-  within that of a CPU emulation of the GPU algorithm (p95 ratio 0.84-0.94, σ ratio 1.00-1.04).
+- **Logits** against a true FP32 reference (16 prompts × 64 steps), relative to a CPU emulation of the GPU algorithm
+  with the same weights: p95 error ratio 0.84-0.94 and σ ratio 1.00-1.04 for all four default configurations (below 1
+  = closer to FP32 than the emulated GPU).
 - **GSM8K / MMLU-Pro** (1,319 / 1,000 questions): FP8 equals BF16 weights within one paired standard error
   (GSM8K greedy 0.9712 both).
 - **Audio**: word error rate 2.19-2.26 % on 1,551 LibriSpeech test-clean words without speculation.

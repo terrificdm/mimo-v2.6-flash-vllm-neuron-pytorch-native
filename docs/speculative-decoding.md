@@ -28,13 +28,13 @@ and least often on random-token prompts.
   | 1M | 1.87 / 1.54 | — | — |
 
   GSM8K through `scripts/run_bench.sh` (200 questions, 4 workers, greedy) finishes in 180 s with MTP k=3 against
-  277 s without speculation on `1m_c4`, with the same score.
+  277 s without speculation on `1m_c4` (scores 98.0 % and 97.0 %, within the noise of 200 questions).
 - **Random-token prompts** (the worst case): with GPU-aligned sampling the 8K server at concurrency 4-16 is 0.97-1.04×
   of `off`, the 1M server at concurrency 4 0.89-0.96× and at concurrency 8 1.01-1.11×; greedy stays at 1.20-1.64×.
   At concurrency 1: 8K 1.43× / 2.14×, 1M 1.39× / 2.17× (GPU-aligned / greedy). The random-prompt rows of
   `scripts/run_bench.sh` show this case: decode time per token barely changes at 512 input tokens, while the
-  8192-token row drops from 16.1 to 8.0 ms per output token.
-- **Long prompts**: the draft layer adds work to prefill, so time to first token at 32K-940K tokens is 9-11 % longer
+  8192-token row drops from 16.1 to 8.0 ms per output token (`1m_c4`).
+- **Long prompts**: the draft layer adds work to prefill, so time to first token at 32K-940K tokens is 8-11 % longer
   with MTP k=3 than with `off`.
 - **DFlash** is fastest at concurrency 1 (8K natural text: 2.0-2.3× of `off`; random prompts greedy 8K 2.68×, 1M
   2.40×, but only 1.06× with GPU-aligned sampling). At concurrency 4 and above it is usually behind MTP k=3.

@@ -39,8 +39,7 @@ Same scheme as the official H100 deployment: FP8 linear layers, FP8 experts × B
 - **Linear layers (qkv, layer-0 MLP)**: the GPU algorithm, block FP8 × FP8 with 128 × 128 weight blocks and
   per-token, per-128-column dynamic activation scales. trn2 has no block-scaled FP8 matmul kernel, so the FP8 codes
   are multiplied at BF16 rate with FP32 accumulation and the block scales applied in FP32: numerically FP8 × FP8,
-  speed of BF16. trn2's FP8 E4M3 has a smaller range than E4M3FN; the loader halves the codes and doubles the scales,
-  which is exact. `o_proj`, embedding, LM head and router stay BF16, as on GPU.
+  speed of BF16. `o_proj`, embedding, LM head and router stay BF16, as on GPU.
 - **Experts**: the checkpoint's MXFP4 values are re-encoded as FP8 E4M3 with one scale per output row. For this
   checkpoint every one of the 36,096 expert tensors is reproduced exactly, so no layer falls back to BF16. The
   kernels convert FP8 tiles to BF16 in SBUF and multiply with BF16 activations.
@@ -89,7 +88,7 @@ Same scheme as the official H100 deployment: FP8 linear layers, FP8 experts × B
 - Vision buckets: 1024, 4096, 16384 and 32768 patches per encoder call; larger videos are split by frame group
   (attention is per frame group, as in the reference code).
 - Encoder outputs are stored in an encoder cache of 512-token blocks; one item may use at most 224 blocks on the 1M
-  profiles (114,688 tokens). Longer items are rejected with HTTP 400 before they reach the engine.
+  profiles (114,688 tokens). Longer items get HTTP 400 with the reason; the server keeps running.
 
 ## Sampling and API behavior aligned with GPU vLLM
 
@@ -114,8 +113,9 @@ on the CPU with the GPU's dtype path.
   0.84-0.94× (p95) of a CPU emulation of the GPU algorithm and their σ is 1.00-1.04× of it.
 - **Downstream** (FP8 vs BF16 weights on the same server; GSM8K 1,319 questions, MMLU-Pro 1,000): GSM8K greedy
   0.9712 / 0.9712, MMLU-Pro greedy 0.778 / 0.779; all paired differences within one paired standard error.
-- **Multimodal**: audio word error rate 2.19-2.26 % on 1,551 LibriSpeech words (GPU dtype path on CPU: 1.93 %; FP32:
-  2.19 %); the vision encoder matches the reference within the tested tolerance.
+- **Multimodal**: audio word error rate 2.19-2.26 % on 1,551 LibriSpeech words without speculation (audio embeddings
+  from the GPU dtype path injected instead: 1.93 %; FP32 embeddings injected: 2.19 %; details in
+  [results/accuracy_summary.md](../results/accuracy_summary.md#3-audio)).
 - **Long context**: needle-in-a-haystack at 32K and 128K 20/20; 1M (999,996 tokens) correct.
 - Results of `scripts/run_bench.sh`: [results/bench_summary.md](../results/bench_summary.md).
 

@@ -39,12 +39,12 @@ Notes:
 - **Prefill buckets.** A prefill step is padded to the smallest bucket that holds it, and the padded rows are
   computed. A 500-token prompt on a profile whose smallest bucket is 1024 costs the same as a 1000-token prompt.
   The 512 bucket of the 1M profiles brings a 512-token request's time to first token from about 253 ms to about
-  201 ms. Prompts longer than `--max-num-batched-tokens` are prefilled in segments of 8192 tokens.
+  201 ms. Prompts longer than `--max-num-batched-tokens` are prefilled in several steps of at most that many tokens.
 - **Decode buckets.** Decode graphs are compiled once per decode bucket for the full `--max-model-len`; the NKI
   decode kernel reads only the KV blocks a request actually has, so a short request on the 1M server decodes about
   as fast as on the 8K server.
-- **`1m` vs `1m_c4`.** With 8 requests in flight, system throughput on `1m` is about 20-30 % higher than on
-  `1m_c4`; at concurrency 1 the two are within 1 %. The cost is per-request latency when 8 requests run together.
+- **`1m` vs `1m_c4`.** With 8 requests in flight, system throughput on `1m` is about 15-30 % higher than with
+  4 (21 % without speculation, 15-29 % with MTP k=3 depending on sampling); at concurrency 1 the two are within 1 %. The cost is per-request latency when 8 requests run together.
   `1m_c4` has different decode buckets and compiles its own graphs on its first start.
 - **torch attention** computes over `--max-model-len`, so it is offered for 8K only. On the 8K server the NKI kernels
   are 10-17 % faster at concurrency 1-32 with speculative decoding off.
@@ -74,7 +74,7 @@ difference from linear placement is the order of the cross-rank sum.
 - Used by `1m` / `1m_c4` with `off` and MTP. Not used with DFlash or on the 8K profiles.
 - Effect (placement ÷ linear, time to first token): code 0.90-0.92, English documents 0.94-0.95, Chinese documents
   0.97-0.98, legal text 1.01-1.02, synthetic 128K / 1M prompts 1.00-1.01. Prefix-cache hits and short requests are
-  0-3 % slower. Decode is within ±1 % (3 % faster at concurrency 8 without speculation). About 1.1 GiB more HBM
+  0-4 % slower. Decode is within ±1 % (3 % faster at concurrency 8 without speculation). About 1.1 GiB more HBM
   per core.
 - The table was fitted on prefill expert loads of natural text (English and Chinese documents, Python source).
   If your traffic is very different, the gain can shrink; for prefix-hit or short-request traffic you can drop

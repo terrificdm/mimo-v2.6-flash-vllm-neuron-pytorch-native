@@ -11,7 +11,7 @@ It contains code adapted from, or written with reference to, the third-party pro
   patches/vllm-neuron/*.patch are changes to vllm-neuron and contain context lines of its source files.
   vllm-neuron itself is not redistributed here: scripts/setup_source.sh clones it from GitHub at the pinned
   commit and applies the patches.
-  0001 modifies existing vllm-neuron modules; 0003 adds the MiMo-V2 model package and its NKI kernels, which
+  0001 modifies existing vllm-neuron modules and adds four new ones; 0003 adds the MiMo-V2 model package and its NKI kernels, which
   follow the structure of the existing vllm-neuron model packages.
 
 -------------------------------------------------------------------------------

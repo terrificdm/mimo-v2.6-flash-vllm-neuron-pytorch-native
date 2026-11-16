@@ -19,6 +19,7 @@ Usage: python3 scripts/api_tests/smoke.py [--no-mm] [--out <prefix>]
 Environment: MIMO_API_BASE (default http://127.0.0.1:8000), MIMO_API_MODEL (default mimo-v2.6-flash).
 Exit code: 0 every case passed; 1 some case failed; 2 server unreachable.
 """
+import argparse
 import concurrent.futures as cf
 import json
 import os
@@ -43,7 +44,8 @@ def text_of(rec):
 
 
 def main():
-    ap = C.base_argparser(__doc__)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", default=None, help="output path prefix (writes <out>.json and <out>.md)")
     ap.add_argument("--no-mm", action="store_true", help="skip the image / video / audio cases")
     a = ap.parse_args()
     if not C.server_ready():

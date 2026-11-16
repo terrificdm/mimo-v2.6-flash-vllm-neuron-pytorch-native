@@ -42,7 +42,6 @@ set -o pipefail
 # shellcheck disable=SC1091
 source "$(dirname "$0")/env.sh"
 
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BASE_URL=${BASE_URL:-http://127.0.0.1:8000}
 SERVED_MODEL=${SERVED_MODEL:-mimo-v2.6-flash}
 MODEL_DIR=${MODEL_DIR:-$HF_SNAPSHOT}

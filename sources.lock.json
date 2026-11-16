@@ -8,7 +8,7 @@
  "patches": [
   {
    "file": "0001-vllm-neuron-framework-changes-for-MiMo-V2.6-Flash.patch",
-   "sha256": "f95f70b0c7184a4c2d29f45ab3316767b96b4b0ec21828855ae3550f28c86655"
+   "sha256": "8dd8906ab080d3a400fb0c8312489bcb0b2e62a6f346563678e70c412d80adfb"
   },
   {
    "file": "0002-mimo_v2-vendored-copy-of-the-nkilib-moe_tkg-kernels.patch",

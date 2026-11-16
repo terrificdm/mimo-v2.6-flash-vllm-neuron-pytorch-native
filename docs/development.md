@@ -27,7 +27,7 @@ order by `scripts/setup_source.sh`:
 
 | Patch | Content |
 |---|---|
-| `0001-vllm-neuron-framework-changes-for-MiMo-V2.6-Flash.patch` | changes to 25 existing vllm-neuron files: registry, NeuronConfig, KV cache, scheduler, sampling, speculative decoding, structured outputs, model runner / worker, accuracy tooling |
+| `0001-vllm-neuron-framework-changes-for-MiMo-V2.6-Flash.patch` | changes 21 existing vllm-neuron files and adds 4 (MTP proposer, host logits processing, encoder-cache manager, an accuracy helper): registry, NeuronConfig, KV cache, scheduler, sampling, speculative decoding, structured outputs, platform checks, model runner / worker, accuracy tooling |
 | `0002-mimo_v2-vendored-copy-of-the-nkilib-moe_tkg-kernels.patch` | `vllm_neuron/model/mimo_v2/nki_moe_tkg/`: copy of nkilib's MoE token-generation kernels |
 | `0003-mimo_v2-MiMo-V2.6-Flash-model-for-the-native-backend.patch` | `vllm_neuron/model/mimo_v2/` and `vllm_neuron/_kernels/mimo_v2/`: the model package and its NKI attention kernels |
 
@@ -45,11 +45,15 @@ cd $MIMO_ROOT/src/vllm-neuron            # branch mimo-v2.6-flash, three commits
 git commit -am "mimo_v2: ..."
 ```
 
-A changed tree gets a new compile-cache directory automatically (`scripts/serve.sh` puts the tree hash into
-`VLLM_CACHE_ROOT`), so the next start compiles again. To publish the change, regenerate the patches and the lock file:
+Commit before you restart the server: `scripts/serve.sh` puts the hash of the committed tree (`HEAD^{tree}`) into
+`VLLM_CACHE_ROOT`, so a new commit gets a new compile-cache directory and the next start compiles again. Uncommitted
+edits keep the old directory, which can load stale graphs. A checkout with your commits no longer matches
+`sources.lock.json`, so `scripts/setup_source.sh` refuses it until the lock file is updated. To publish the change,
+regenerate the patches and the lock file:
 
 ```bash
 cd $MIMO_ROOT/src/vllm-neuron
+rm <repo>/patches/vllm-neuron/*.patch
 git format-patch --zero-commit -o <repo>/patches/vllm-neuron eb6cb360f7cff6082e22a9437d8ce0ba3891304a..HEAD
 # then update "patches" (sha256 per file), "expected_head_tree" (git rev-parse 'HEAD^{tree}') and
 # "expected_vllm_neuron_subtree" (git rev-parse HEAD:vllm_neuron) in sources.lock.json

@@ -19,7 +19,8 @@ below 1 mean the device is closer to FP32 than the emulated GPU.
 
 ## 2. FP8 against BF16 weights
 
-Same server, FP8 weights (the deployment) against the checkpoint dequantized to BF16, with the lm-eval harness:
+Same server configuration, FP8 weights (the deployment) against the checkpoint dequantized to BF16, with the lm-eval
+harness (0-shot chat, thinking on, `max_tokens` 4096):
 
 | Task | BF16 | FP8 | Paired difference |
 |---|---|---|---|

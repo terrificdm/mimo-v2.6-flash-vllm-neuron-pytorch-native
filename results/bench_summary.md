@@ -20,8 +20,8 @@ Summaries: [bench/](bench/).
 | image / video / audio (TTFT, median of 3) | 0.22 / 0.33 / 0.22 s | — | — |
 | image / video / audio (total time, median of 3) | 0.25 / 0.41 / 0.41 s | — | — |
 
-GSM8K 98.0 %, MMLU 79.5 % (200 questions each). HBM per logical core: 20.96 GiB at ready, 21.67 GiB at most after
-the 940K prompt (limit 24 GiB). First start from an empty compile cache: 1,877 s.
+GSM8K 98.0 %, MMLU 79.5 % (200 questions each). HBM per logical core: 20.96 GiB at ready, 21.67 GiB on the busiest
+core after the 940K prompt (limit 24 GiB). First start from an empty compile cache: 1,877 s.
 
 GSM8K / MMLU wall time with 4 workers: 196 s / 46 s. Summary: [bench/1m-mtp3.summary.json](bench/1m-mtp3.summary.json).
 
@@ -97,7 +97,7 @@ Reading the comparison:
 - **Short prompts** reach the first token as fast as before (201 ms against 198 ms); without the 512-token prefill
   bucket the native server took 253 ms, because a 512-token prompt was padded to 1024 tokens.
 - **MTP k=3** helps where drafts are accepted (8K row: TPOT 16.1 → 8.0 ms; GSM8K 35 % less wall time) and costs
-  9-11 % prefill time on long prompts; on the random-token rows it gains little, and at concurrency 4 with short
+  8-11 % prefill time on long prompts; on the random-token rows it gains little, and at concurrency 4 with short
   prompts it lowers throughput (140.6 → 114.2 tok/s).
 - Accuracy differences are within the noise of 200 questions (paired McNemar p ≈ 0.6).
 - First start from an empty compile cache: 105 minutes on the XLA deployment, 31 minutes native (`1m`, MTP k=3).

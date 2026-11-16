@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # SPDX-License-Identifier: Apache-2.0
 # Paths and environment shared by the scripts in this directory. Sourced, not executed.
 # Override any variable by exporting it before you run a script, for example
